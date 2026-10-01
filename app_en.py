@@ -89,10 +89,18 @@ def enviar_mensaje_contacto(mensaje, nombre_remitente, email_remitente):
     cuerpo += f"\n— Sent from Espectrometrika on {datetime.datetime.now():%Y-%m-%d %H:%M}"
 
     # --- Option 1: Formspree (no email credentials needed) ---
-    try:
-        endpoint = st.secrets["formspree"]["endpoint"]
-    except Exception:
-        endpoint = None
+    # Checked in two possible places, since different hosting platforms expose
+    # configuration differently:
+    #   - Posit Connect Cloud "Secret variables" become plain environment
+    #     variables, so we check os.environ first.
+    #   - Local development / Streamlit Community Cloud use a
+    #     .streamlit/secrets.toml file, read through st.secrets.
+    endpoint = os.environ.get("FORMSPREE_ENDPOINT")
+    if not endpoint:
+        try:
+            endpoint = st.secrets["formspree"]["endpoint"]
+        except Exception:
+            endpoint = None
     if endpoint:
         try:
             import requests
@@ -110,11 +118,20 @@ def enviar_mensaje_contacto(mensaje, nombre_remitente, email_remitente):
             return False, f"Could not send the message right now ({e})."
 
     # --- Option 2: SMTP fallback ---
-    try:
-        smtp_cfg = st.secrets["smtp"]
-    except Exception:
-        return False, ("Feedback form is not configured yet (missing Formspree or SMTP secrets). "
-                        "Ask the app maintainer to set up .streamlit/secrets.toml.")
+    # Same idea: plain env vars first (Posit Connect Cloud), then secrets.toml.
+    if os.environ.get("SMTP_SERVER"):
+        smtp_cfg = {
+            "server": os.environ.get("SMTP_SERVER"),
+            "port": os.environ.get("SMTP_PORT", 587),
+            "user": os.environ.get("SMTP_USER"),
+            "password": os.environ.get("SMTP_PASSWORD"),
+        }
+    else:
+        try:
+            smtp_cfg = st.secrets["smtp"]
+        except Exception:
+            return False, ("Feedback form is not configured yet (missing Formspree or SMTP "
+                            "configuration). Ask the app maintainer to set it up.")
 
     msg = EmailMessage()
     msg["Subject"] = "Espectrometrika — New feedback message"
@@ -1170,7 +1187,7 @@ with tabs[1]:
 with tabs[2]:
     st.subheader("Principal Component Analysis (PCA)")
 
-    ids, _, clases = datos_activos()
+    ids_actuales, _, clases_actuales = datos_activos()
     X_pca_input = st.session_state.X_pret[indice_activo()]
     n_muestras, n_variables = X_pca_input.shape
     n_comp_max = min(n_muestras - 1, n_variables)
@@ -1191,6 +1208,13 @@ with tabs[2]:
                     st.session_state.cargas_completo = _pca_completo.components_
                     st.session_state.autovalores = _pca_completo.explained_variance_
                     st.session_state.var_explicada = _pca_completo.explained_variance_ratio_ * 100
+                    # IMPORTANT: freeze EVERYTHING this PCA result is consistent with —
+                    # if outlier exclusions change afterwards (without clicking Update),
+                    # using live data/ids anywhere downstream would silently mismatch
+                    # this frozen result in length. Outliers (next tab) reuses all of this.
+                    st.session_state.pca_X_input = X_pca_input
+                    st.session_state.pca_ids = ids_actuales
+                    st.session_state.pca_clases = clases_actuales
                     st.session_state.pca_firma = firma_datos_activos()
                 st.rerun()
 
@@ -1201,8 +1225,15 @@ with tabs[2]:
             scores_completo = st.session_state.scores_completo
             cargas_completo = st.session_state.cargas_completo
             autovalores = st.session_state.autovalores
+            ids = st.session_state.pca_ids
+            clases = st.session_state.pca_clases
             var_explicada = st.session_state.var_explicada
             var_acumulada = np.cumsum(var_explicada)
+            # Use the STORED result's own dimensions from here on, not the live
+            # dataset's — if outliers were excluded/restored after this PCA was
+            # computed (without clicking Update), the live data could have a
+            # different number of samples/components than this stale result.
+            n_comp_max_guardado = len(var_explicada)
 
             col1, col2 = st.columns([2, 1])
             with col1:
@@ -1221,7 +1252,7 @@ with tabs[2]:
                 st.plotly_chart(fig, width='stretch')
             with col2:
                 n_comp = st.slider("Components to retain (n_comp)", min_value=2,
-                                    max_value=min(10, n_comp_max), value=min(3, n_comp_max),
+                                    max_value=min(10, n_comp_max_guardado), value=min(3, n_comp_max_guardado),
                                     help="How many principal components to keep for scores/loadings plots "
                                          "and for outlier detection (T²/Q). Check the scree plot on the "
                                          "left: pick enough to capture most of the variance, without "
@@ -1249,7 +1280,7 @@ with tabs[2]:
                 fig.update_layout(height=420)
                 return fig
 
-            n_comp_disponibles = min(15, n_comp_max)
+            n_comp_disponibles = min(15, n_comp_max_guardado)
             opciones_pc = list(range(1, n_comp_disponibles + 1))
             st.markdown("**2D scores plots** — pick any pair of components to compare "
                          f"(up to PC{n_comp_disponibles}).")
@@ -1270,7 +1301,7 @@ with tabs[2]:
                 st.plotly_chart(grafico_scores(pcx_2, pcy_2), width='stretch')
 
             st.markdown("**Interactive 3D plot (drag to rotate)**")
-            if n_comp_max >= 3:
+            if n_comp_max_guardado >= 3:
                 cc5, cc6, cc7 = st.columns(3)
                 pcx_3d = cc5.selectbox("X axis", opciones_pc, index=0, key="pcx_3d")
                 pcy_3d = cc6.selectbox("Y axis", opciones_pc, index=min(1, n_comp_disponibles - 1), key="pcy_3d")
@@ -1300,12 +1331,16 @@ with tabs[3]:
     if st.session_state.get("pca_completo") is None:
         st.info("Compute PCA first, in the **PCA** tab (needs at least 2 components).")
     else:
-        ids, _, clases = datos_activos()
-        X_pca_input = st.session_state.X_pret[indice_activo()]
+        # Use the SAME frozen snapshot the PCA result itself was computed from —
+        # not live data — so they always stay consistent in length with each other,
+        # regardless of outlier exclusions made afterwards without clicking Update.
+        ids = st.session_state.pca_ids
+        clases = st.session_state.pca_clases
+        X_pca_input = st.session_state.pca_X_input
         scores_completo = st.session_state.scores_completo
         cargas_completo = st.session_state.cargas_completo
         autovalores = st.session_state.autovalores
-        n_comp = st.session_state.n_comp
+        n_comp = min(st.session_state.n_comp, len(st.session_state.var_explicada))
         n_muestras = X_pca_input.shape[0]
 
         col1, col2, col3 = st.columns(3)
@@ -1335,12 +1370,20 @@ with tabs[3]:
                     X_pca_input, scores_completo, cargas_completo, autovalores,
                     st.session_state.pca_completo.mean_, n_comp, alpha,
                 )
+                # Freeze the ids/classes THIS result goes with. PCA can be updated
+                # independently afterwards (different sample count) — if that
+                # happens before Outliers is also updated, using PCA's "current"
+                # ids here instead of this frozen snapshot would mismatch T2/Q below.
+                st.session_state.outliers_ids = ids
+                st.session_state.outliers_clases = clases
                 st.session_state.outliers_firma = _firma_outliers_actual
             st.rerun()
 
         if st.session_state.get("outliers_resultado") is None:
             st.info("Click **Compute outliers** above to get started.")
         else:
+            ids = st.session_state.outliers_ids
+            clases = st.session_state.outliers_clases
             T2, T2_lim, Q, Q_lim, Q_lim_confiable = st.session_state.outliers_resultado
             if not Q_lim_confiable:
                 st.warning(
