@@ -102,6 +102,16 @@ def enviar_mensaje_contacto(mensaje, nombre_remitente, email_remitente):
         except Exception:
             endpoint = None
     if endpoint:
+        # Defensive cleanup: strip whitespace and a common copy/paste mistake
+        # (pasting a label like "URL: " or "Endpoint: " along with the value).
+        endpoint = endpoint.strip()
+        for _prefijo in ("URL:", "Url:", "url:", "Endpoint:", "endpoint:"):
+            if endpoint.startswith(_prefijo):
+                endpoint = endpoint[len(_prefijo):].strip()
+        if not endpoint.startswith(("http://", "https://")):
+            return False, (f"The configured Formspree endpoint doesn't look like a valid URL "
+                            f"({endpoint!r}). Check the FORMSPREE_ENDPOINT value — it should be "
+                            f"only the URL, e.g. https://formspree.io/f/xxxxxxxx, nothing else.")
         try:
             import requests
             respuesta = requests.post(
@@ -339,6 +349,30 @@ def como_texto(clases):
     return np.array([str(c) for c in clases])
 
 
+def ejes_a_float(valores):
+    """Converts a list/array of axis labels (wavenumbers, retention times,
+    chemical shifts...) to float, auto-fixing the European decimal comma
+    (e.g. "1500,5" -> "1500.5") when needed — some instruments/software
+    export spectra with a comma instead of a dot as the decimal separator,
+    and plain float() can't parse that on its own."""
+    valores_texto = [str(v).strip() for v in valores]
+    try:
+        return np.array(valores_texto, dtype=float)
+    except ValueError:
+        pass
+
+    def _arreglar(v):
+        if "," in v and "." not in v:
+            # Only a comma present: it's a decimal separator (e.g. "1500,5").
+            return v.replace(",", ".")
+        if "," in v and "." in v:
+            # Both present: the comma is a thousands separator (e.g. "1,500.5").
+            return v.replace(",", "")
+        return v
+
+    return np.array([_arreglar(v) for v in valores_texto], dtype=float)
+
+
 # =============================================================================
 # SESSION STATE
 # =============================================================================
@@ -482,11 +516,11 @@ def aplicar_paso(X_in, paso_tup):
 with st.sidebar:
     _logo_b64 = _img_b64("logo_espectrometrika_solo.png")
     st.markdown(f"""
-    <div style="margin-bottom:2px;">
-        <img src="{_logo_b64}" style="height:34px;">
+    <div style="margin-bottom:2px; padding-top:6px; line-height:0; overflow:visible;">
+        <img src="{_logo_b64}" style="height:34px; display:block; overflow:visible;">
     </div>
     """, unsafe_allow_html=True)
-    st.caption("Preprocessing, exploratory analysis, classification, regression & SIMCA")
+    st.caption("Preprocessing, exploratory analysis, classification & regression")
 
     if hay_datos():
         if st.button("🏠 Back to home", use_container_width=True,
@@ -684,7 +718,7 @@ with st.sidebar:
                 if opcion_valor_y in columnas_restantes:
                     columnas_restantes.remove(opcion_valor_y)
 
-            numeros_onda = np.array(columnas_restantes, dtype=float)
+            numeros_onda = ejes_a_float(columnas_restantes)
             X = df_completo[columnas_restantes].to_numpy(dtype=float)
 
             cambio_tamano = (st.session_state.X is None) or (st.session_state.X.shape[0] != X.shape[0])
@@ -847,8 +881,8 @@ with st.sidebar:
 if not hay_datos():
     _logo_hero_b64 = _img_b64("logo_espectrometrika_solo.png")
     st.markdown(f"""
-    <div style="margin-bottom:6px;">
-        <img src="{_logo_hero_b64}" style="height:70px;">
+    <div style="margin-bottom:6px; padding-top:10px; line-height:0; overflow:visible;">
+        <img src="{_logo_hero_b64}" style="height:70px; display:block; overflow:visible;">
     </div>
     <p style="font-family:'Inter',sans-serif; font-size:1.05rem; color:#4A5A63; max-width:820px;
               margin-top:2px; margin-bottom:28px; line-height:1.5;">
@@ -865,7 +899,7 @@ if not hay_datos():
     def _tarjeta(titulo, texto, bg, borde):
         st.markdown(f"""
         <div style="background:{bg}; border-left:4px solid {borde}; border-radius:10px;
-                    padding:18px 20px; height:210px;">
+                    padding:18px 20px; min-height:210px;">
             <div style="font-family:'Inter',sans-serif; font-weight:700; font-size:1.02rem;
                         color:#0B3D54; margin-bottom:8px;">{titulo}</div>
             <div style="font-family:'Inter',sans-serif; font-size:0.92rem; color:#3D4A52;
@@ -906,20 +940,12 @@ if not hay_datos():
     </div>
     """, unsafe_allow_html=True)
 
-    _hero_img_b64 = _img_b64("hero_spectra.png")
-    if _hero_img_b64:
-        st.markdown(f"""
-        <div style="margin-top:36px; text-align:center;">
-            <img src="{_hero_img_b64}" style="max-width:78%; opacity:0.92;">
-        </div>
-        """, unsafe_allow_html=True)
-
     st.stop()
 
 _logo_top_b64 = _img_b64("logo_espectrometrika_solo.png")
 st.markdown(f"""
-<div style="margin-bottom:6px;">
-    <img src="{_logo_top_b64}" style="height:22px; opacity:0.9;">
+<div style="margin-bottom:6px; padding-top:6px; line-height:0; overflow:visible;">
+    <img src="{_logo_top_b64}" style="height:22px; opacity:0.9; display:block; overflow:visible;">
 </div>
 """, unsafe_allow_html=True)
 
@@ -3339,7 +3365,7 @@ with tabs[9]:
                 else:
                     df_nuevo = pd.read_excel(archivo_nuevo, index_col=0)
                 ids_nuevo = df_nuevo.index.astype(str).to_numpy()
-                eje_nuevo = df_nuevo.columns.astype(float).to_numpy()
+                eje_nuevo = ejes_a_float(df_nuevo.columns.tolist())
                 X_nuevo = df_nuevo.to_numpy(dtype=float)
 
                 # 1) Interpolate onto the exact axis the model was trained with
