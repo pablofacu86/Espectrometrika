@@ -1,0 +1,16 @@
+streamlit
+numpy
+pandas
+scipy
+scikit-learn
+plotly
+matplotlib
+seaborn
+openpyxl
+umap-learn
+xgboost
+boruta
+joblib
+fpdf2
+optuna
+requests
