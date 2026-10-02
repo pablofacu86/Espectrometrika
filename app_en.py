@@ -173,14 +173,25 @@ st.markdown("""
     h1, h2, h3 {color: #0B3D54; font-family: 'Inter', sans-serif; font-weight: 700;}
     div[data-testid="stMetricValue"] {color: #0B3D54;}
     .stTabs [data-baseweb="tab-list"] {
-        gap: 4px;
-        flex-wrap: wrap;
-        row-gap: 2px;
+        gap: 4px !important;
+        flex-wrap: wrap !important;
+        row-gap: 2px !important;
+        overflow-x: visible !important;
+        white-space: normal !important;
+        height: auto !important;
     }
+    .stTabs [data-baseweb="tab-border"] {display: none !important;}
+    .stTabs [data-baseweb="tab-highlight"] {display: none !important;}
+    /* Hide the left/right scroll-arrow buttons Streamlit adds for overflowing
+       tab bars — with wrapping forced above, they're not needed and were
+       hiding tabs behind them instead of showing everything. */
+    .stTabs button[data-testid="stTabsScrollButton"] {display: none !important;}
+    .stTabs [data-baseweb="tab-list"] > div:first-child:not([role="tab"]) {display: none !important;}
     .stTabs [data-baseweb="tab"] {
         border-radius: 8px 8px 0 0;
-        padding: 8px 16px;
+        padding: 6px 10px !important;
         font-weight: 500;
+        font-size: 0.88rem !important;
     }
     .stTabs [aria-selected="true"] {
         color: #0B3D54 !important;
