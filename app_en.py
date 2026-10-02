@@ -169,10 +169,14 @@ st.markdown("""
         font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
     }
 
-    .block-container {padding-top: 2rem;}
+    .block-container {padding-top: 3.5rem;}
     h1, h2, h3 {color: #0B3D54; font-family: 'Inter', sans-serif; font-weight: 700;}
     div[data-testid="stMetricValue"] {color: #0B3D54;}
-    .stTabs [data-baseweb="tab-list"] {gap: 4px;}
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 4px;
+        flex-wrap: wrap;
+        row-gap: 2px;
+    }
     .stTabs [data-baseweb="tab"] {
         border-radius: 8px 8px 0 0;
         padding: 8px 16px;
@@ -181,6 +185,19 @@ st.markdown("""
     .stTabs [aria-selected="true"] {
         color: #0B3D54 !important;
         border-bottom-color: #14B8A6 !important;
+    }
+    /* "Home" is always the first tab — give it its own accent color so it
+       stands out from the rest, even when it isn't the selected tab. */
+    .stTabs [data-baseweb="tab-list"] button:first-child {
+        color: #D97706 !important;
+    }
+    .stTabs [data-baseweb="tab-list"] button:first-child[aria-selected="true"] {
+        color: #D97706 !important;
+        border-bottom-color: #D97706 !important;
+    }
+    .stTabs [data-baseweb="tab-list"] button:first-child p {
+        color: #D97706 !important;
+        font-weight: 700 !important;
     }
     div[data-testid="stSidebar"] {
         border-right: 1px solid rgba(11, 61, 84, 0.12);
@@ -516,18 +533,11 @@ def aplicar_paso(X_in, paso_tup):
 with st.sidebar:
     _logo_b64 = _img_b64("logo_espectrometrika_solo.png")
     st.markdown(f"""
-    <div style="margin-bottom:2px; padding-top:6px; line-height:0; overflow:visible;">
-        <img src="{_logo_b64}" style="height:34px; display:block; overflow:visible;">
+    <div style="margin-bottom:2px;">
+        <img src="{_logo_b64}" style="height:46px; display:block;">
     </div>
     """, unsafe_allow_html=True)
     st.caption("Preprocessing, exploratory analysis, classification & regression")
-
-    if hay_datos():
-        if st.button("🏠 Back to home", use_container_width=True,
-                      help="Return to the welcome screen. This clears the loaded dataset "
-                           "and all current results."):
-            st.session_state.clear()
-            st.rerun()
 
     _inti_b64 = _img_b64("inti_logo.png")
     if _inti_b64:
@@ -878,11 +888,35 @@ with st.sidebar:
 # MAIN BODY: tabs
 # =============================================================================
 
-if not hay_datos():
+_logo_top_b64 = _img_b64("logo_espectrometrika_solo.png")
+st.markdown(f"""
+<div style="margin-bottom:10px; margin-top:4px;">
+    <img src="{_logo_top_b64}" style="height:30px; opacity:0.9; display:block;">
+</div>
+""", unsafe_allow_html=True)
+
+tabs = st.tabs([
+    "🏠 Home",
+    "📈 Data",
+    "🧪 Preprocessing",
+    "🧭 PCA",
+    "🚩 Outliers",
+    "🌳 Dendrogram",
+    "🛠️ Other tools",
+    "🏷️ Classification",
+    "🧬 SIMCA",
+    "📉 Regression",
+    "🔮 Prediction",
+])
+
+# -----------------------------------------------------------------------
+# TAB: HOME
+# -----------------------------------------------------------------------
+with tabs[0]:
     _logo_hero_b64 = _img_b64("logo_espectrometrika_solo.png")
     st.markdown(f"""
-    <div style="margin-bottom:6px; padding-top:10px; line-height:0; overflow:visible;">
-        <img src="{_logo_hero_b64}" style="height:70px; display:block; overflow:visible;">
+    <div style="margin-bottom:6px;">
+        <img src="{_logo_hero_b64}" style="height:95px; display:block;">
     </div>
     <p style="font-family:'Inter',sans-serif; font-size:1.05rem; color:#4A5A63; max-width:820px;
               margin-top:2px; margin-bottom:28px; line-height:1.5;">
@@ -933,39 +967,44 @@ if not hay_datos():
             "#FDF6E9", "#D97706",
         )
 
-    st.markdown("""
-    <div style="margin-top:26px;">
-    👈 To get started, upload your spectra file from the left-hand panel — the
-    app will help you identify the header row and the ID/class columns.
-    </div>
-    """, unsafe_allow_html=True)
+    if hay_datos():
+        st.markdown("""
+        <div style="margin-top:26px;">
+        ✅ You already have a dataset loaded — use the tabs above to continue working with it.
+        </div>
+        """, unsafe_allow_html=True)
+        if st.button("🗑️ Clear data and start over", key="btn_reset_home"):
+            st.session_state.clear()
+            st.rerun()
+    else:
+        st.markdown("""
+        <div style="margin-top:26px;">
+        👈 To get started, upload your spectra file from the left-hand panel — the
+        app will help you identify the header row and the ID/class columns.
+        </div>
+        """, unsafe_allow_html=True)
 
+    _hero_img_b64 = _img_b64("hero_spectra.png")
+    if _hero_img_b64:
+        st.markdown(f"""
+        <div style="margin-top:36px; text-align:center;">
+            <img src="{_hero_img_b64}" style="max-width:78%; opacity:0.92;">
+        </div>
+        """, unsafe_allow_html=True)
+
+if not hay_datos():
+    # All the other tabs need a loaded dataset to make sense — show a friendly
+    # placeholder in each of them (so they're not just blank if clicked) and
+    # stop here, before their real logic below (which assumes data exists).
+    for _tab_vacia in tabs[1:]:
+        with _tab_vacia:
+            st.info("📁 Upload a spectra file in the sidebar to get started.")
     st.stop()
-
-_logo_top_b64 = _img_b64("logo_espectrometrika_solo.png")
-st.markdown(f"""
-<div style="margin-bottom:6px; padding-top:6px; line-height:0; overflow:visible;">
-    <img src="{_logo_top_b64}" style="height:22px; opacity:0.9; display:block; overflow:visible;">
-</div>
-""", unsafe_allow_html=True)
-
-tabs = st.tabs([
-    "📈 Data",
-    "🧪 Preprocessing",
-    "🧭 PCA",
-    "🚩 Outliers",
-    "🌳 Dendrogram",
-    "🛠️ Other tools",
-    "🏷️ Classification",
-    "🧬 SIMCA",
-    "📉 Regression",
-    "🔮 Prediction",
-])
 
 # -----------------------------------------------------------------------
 # TAB: DATA
 # -----------------------------------------------------------------------
-with tabs[0]:
+with tabs[1]:
     st.subheader("Data preview")
     st.dataframe(st.session_state.df.head(10), width='stretch')
 
@@ -999,7 +1038,7 @@ with tabs[0]:
 # -----------------------------------------------------------------------
 # TAB: PREPROCESSING
 # -----------------------------------------------------------------------
-with tabs[1]:
+with tabs[2]:
     st.subheader("Spectral preprocessing")
 
     # Important: preprocessing is always computed on ALL samples (not just the
@@ -1210,7 +1249,7 @@ with tabs[1]:
 # -----------------------------------------------------------------------
 # TAB: PCA
 # -----------------------------------------------------------------------
-with tabs[2]:
+with tabs[3]:
     st.subheader("Principal Component Analysis (PCA)")
 
     ids_actuales, _, clases_actuales = datos_activos()
@@ -1351,7 +1390,7 @@ with tabs[2]:
 # -----------------------------------------------------------------------
 # TAB: OUTLIERS
 # -----------------------------------------------------------------------
-with tabs[3]:
+with tabs[4]:
     st.subheader("Outlier detection: Hotelling's T² and Q residual")
 
     if st.session_state.get("pca_completo") is None:
@@ -1551,7 +1590,7 @@ with tabs[3]:
 # -----------------------------------------------------------------------
 # TAB: DENDROGRAM
 # -----------------------------------------------------------------------
-with tabs[4]:
+with tabs[5]:
     st.subheader("Hierarchical Cluster Analysis (HCA)")
 
     ids, _, clases = datos_activos()
@@ -1615,7 +1654,7 @@ with tabs[4]:
 # -----------------------------------------------------------------------
 # TAB: OTHER TOOLS
 # -----------------------------------------------------------------------
-with tabs[5]:
+with tabs[6]:
     st.subheader("Other exploratory analysis tools")
 
     ids, X_activo, clases = datos_activos()
@@ -1812,7 +1851,7 @@ with tabs[5]:
 # -----------------------------------------------------------------------
 # TAB: CLASSIFICATION
 # -----------------------------------------------------------------------
-with tabs[6]:
+with tabs[7]:
     st.subheader("Supervised classification")
     if st.button("🔄 Reset this tab", key="reset_clf",
                  help="Clears all trained models, metrics, and plots from this tab, so you can "
@@ -2360,7 +2399,7 @@ with tabs[6]:
 
 # TAB: SIMCA
 # -----------------------------------------------------------------------
-with tabs[7]:
+with tabs[8]:
     st.subheader("SIMCA — Soft Independent Modeling of Class Analogies")
     if st.button("🔄 Reset this tab", key="reset_simca",
                  help="Clears all trained SIMCA models and results from this tab, so you can start "
@@ -2636,7 +2675,7 @@ with tabs[7]:
 
 # TAB: REGRESSION
 # -----------------------------------------------------------------------
-with tabs[8]:
+with tabs[9]:
     st.subheader("Supervised regression")
     if st.button("🔄 Reset this tab", key="reset_reg",
                  help="Clears all trained models, metrics, and plots from this tab, so you can "
@@ -3256,6 +3295,11 @@ with tabs[8]:
                             "numeros_onda": st.session_state["reg_eje_usado"],
                             "pasos_pretratamiento": st.session_state["reg_pasos_pretratamiento"],
                             "ficha": ficha_r,
+                            # Cross-validation RMSE, kept to build an approximate 95% prediction
+                            # interval later (point prediction ± 1.96 x RMSE_cv) — a standard,
+                            # model-agnostic way to report uncertainty in chemometric calibration,
+                            # independent of which regression algorithm was used.
+                            "rmse_cv": res["cv"]["rmse_cv"],
                         }
                         st.session_state["reg_ultima_ficha"] = ficha_r
                         st.success(f"Model '{nombre_guardado_r}' saved (traceability ID: {id_trazabilidad_r}). "
@@ -3276,7 +3320,7 @@ with tabs[8]:
 
 # TAB: PREDICTION ON NEW SAMPLES
 # -----------------------------------------------------------------------
-with tabs[9]:
+with tabs[10]:
     st.subheader("Prediction on new samples")
 
     with st.expander("💾 Save/load models on your PC (to use them another day)"):
@@ -3412,23 +3456,56 @@ with tabs[9]:
                     df_resultado["assignment"] = [
                         _resumen_asignacion_simca(matriz_dentro_pred.loc[i]) for i in matriz_dentro_pred.index
                     ]
+                    st.dataframe(df_resultado, width='stretch')
                 else:
                     predicciones = bundle["modelo"].predict(X_final)
                     if bundle["tipo"] == "classification":
                         df_resultado = pd.DataFrame({"id": ids_nuevo, "predicted_class": predicciones})
+                        columnas_prob = []
                         if hasattr(bundle["modelo"], "predict_proba"):
                             try:
                                 proba = bundle["modelo"].predict_proba(X_final)
                                 clases_modelo = getattr(bundle["modelo"], "classes_", None)
                                 if clases_modelo is not None:
                                     for j, c in enumerate(clases_modelo):
-                                        df_resultado[f"prob_{c}"] = proba[:, j]
+                                        nombre_col = f"probability_{c}"
+                                        df_resultado[nombre_col] = proba[:, j]
+                                        columnas_prob.append(nombre_col)
+                                    # The probability of whichever class was actually predicted —
+                                    # a quick, single "how confident is the model?" number per sample.
+                                    df_resultado["confidence"] = proba.max(axis=1)
                             except Exception:
                                 pass
+                        st.caption("**confidence** is the model's probability for its own predicted "
+                                   "class — closer to 100% means the model is more sure; values "
+                                   "closer to 1/(number of classes) mean it's essentially guessing.")
+                        if columnas_prob:
+                            formato_cols = {c: "{:.1%}" for c in columnas_prob + ["confidence"]}
+                            st.dataframe(df_resultado.style.format(formato_cols), width='stretch')
+                        else:
+                            st.dataframe(df_resultado, width='stretch')
                     else:
                         df_resultado = pd.DataFrame({"id": ids_nuevo, "predicted_value": predicciones})
-
-                st.dataframe(df_resultado, width='stretch')
+                        rmse_cv_modelo = bundle.get("rmse_cv")
+                        if rmse_cv_modelo is not None:
+                            margen_95 = 1.96 * rmse_cv_modelo
+                            df_resultado["uncertainty_95 (±)"] = margen_95
+                            df_resultado["lower_95"] = predicciones - margen_95
+                            df_resultado["upper_95"] = predicciones + margen_95
+                            st.caption(
+                                f"The **95% interval** (`lower_95` to `upper_95`) is an approximate "
+                                f"prediction interval, built from this model's cross-validation RMSE "
+                                f"(±1.96 × {rmse_cv_modelo:.4g}) — the standard way to report "
+                                f"uncertainty in a chemometric calibration. It assumes the error is "
+                                f"roughly similar in size across the range the model was trained on; "
+                                f"treat it with extra caution for predictions near or beyond the "
+                                f"edges of that range."
+                            )
+                        else:
+                            st.caption("⚠ This model was saved before uncertainty tracking was added "
+                                       "(or loaded from an older .joblib) — no 95% interval available "
+                                       "for it. Retrain and save it again to get one.")
+                        st.dataframe(df_resultado, width='stretch')
                 st.download_button(
                     "⬇️ Download predictions",
                     data=df_resultado.to_csv(index=False).encode("utf-8"),
