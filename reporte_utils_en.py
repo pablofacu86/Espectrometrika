@@ -6,6 +6,8 @@ requiere Kaleido) y fpdf2 para el armado del documento.
 """
 
 import io
+import re
+import datetime
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -28,6 +30,28 @@ _REEMPLAZOS_PDF = {
 }
 
 
+def ahora_str(zona_horaria=None, con_segundos=False):
+    """Fecha y hora actuales como texto, p.ej. "2026-10-05 14:32 (UTC-03:00)".
+    'zona_horaria' es un nombre IANA (p.ej. "America/Argentina/Buenos_Aires",
+    la del navegador del usuario). Si falta o es invalida, usa UTC, y lo dice
+    explicitamente para que la hora nunca sea ambigua."""
+    ahora = None
+    if zona_horaria:
+        try:
+            from zoneinfo import ZoneInfo
+            ahora = datetime.datetime.now(ZoneInfo(zona_horaria))
+        except Exception:
+            ahora = None
+    if ahora is None:
+        ahora = datetime.datetime.now(datetime.timezone.utc)
+    off = ahora.utcoffset() or datetime.timedelta(0)
+    minutos = int(off.total_seconds() // 60)
+    signo = "+" if minutos >= 0 else "-"
+    minutos = abs(minutos)
+    formato = "%Y-%m-%d %H:%M:%S" if con_segundos else "%Y-%m-%d %H:%M"
+    return f"{ahora.strftime(formato)} (UTC{signo}{minutos // 60:02d}:{minutos % 60:02d})"
+
+
 def _sanear(texto):
     """Reemplaza caracteres Unicode comunes que la fuente base de fpdf2 (Helvetica,
     solo Latin-1) no soporta, y descarta cualquier otro carácter no representable
@@ -47,6 +71,8 @@ def fig_a_png_bytes(fig, dpi=150):
 
 
 class ReportePDF(FPDF):
+    fecha_hora = None  # se asigna en crear_reporte()
+
     def header(self):
         pass
 
@@ -54,11 +80,17 @@ class ReportePDF(FPDF):
         self.set_y(-12)
         self.set_font("Helvetica", "I", 8)
         self.set_text_color(150, 150, 150)
-        self.cell(0, 10, f"Page {self.page_no()}", align="C")
+        izquierda = "Espectrometrika"
+        if self.fecha_hora:
+            izquierda += f"  |  Report generated {self.fecha_hora}"
+        self.cell(0, 10, _sanear(izquierda), align="L")
+        self.set_x(self.l_margin)
+        self.cell(0, 10, f"Page {self.page_no()}", align="R")
 
 
-def crear_reporte():
+def crear_reporte(fecha_hora=None):
     pdf = ReportePDF(format="A4", unit="mm")
+    pdf.fecha_hora = fecha_hora or ahora_str()
     pdf.set_auto_page_break(auto=True, margin=18)
     pdf.set_margins(18, 16, 18)
     pdf.add_page()
@@ -77,6 +109,11 @@ def titulo_portada(pdf, titulo, subtitulo=None):
         pdf.set_font("Helvetica", "", 12)
         pdf.set_text_color(*GRIS)
         pdf.multi_cell(0, 7, _sanear(subtitulo), align="C")
+    if getattr(pdf, "fecha_hora", None):
+        pdf.ln(8)
+        pdf.set_font("Helvetica", "", 11)
+        pdf.set_text_color(*GRIS)
+        pdf.multi_cell(0, 6, _sanear(f"Generated on {pdf.fecha_hora}"), align="C")
     pdf.set_text_color(0, 0, 0)
 
 
@@ -120,55 +157,275 @@ def imagen_desde_fig(pdf, fig, ancho_mm=170):
     pdf.ln(2)
 
 
-def _dibujar_encabezado_tabla(pdf, encabezados, anchos):
-    pdf.set_font("Helvetica", "B", 9.5)
-    pdf.set_fill_color(*VERDE)
-    pdf.set_text_color(255, 255, 255)
-    for h, w in zip(encabezados, anchos):
-        pdf.cell(w, 7, _sanear(h), border=0, fill=True)
-    pdf.ln(7)
-    pdf.set_text_color(0, 0, 0)
-    pdf.set_font("Helvetica", "", 9)
+def imagen_desde_png(pdf, png_bytes, ancho_mm=170):
+    """Inserta una imagen PNG ya renderizada (p.ej. un clustermap guardado)."""
+    pdf.image(io.BytesIO(png_bytes), x=(210 - ancho_mm) / 2, w=ancho_mm)
+    pdf.ln(2)
 
 
-def tabla(pdf, encabezados, filas, anchos=None):
-    """Tabla con salto de página manual: antes de dibujar cada fila se chequea
-    si entra en el espacio restante; si no entra, se agrega una página nueva
-    (repitiendo el encabezado) ANTES de dibujarla, para que ninguna fila quede
-    cortada a la mitad entre dos páginas."""
-    ancho_total = 210 - 2 * 18
-    if anchos is None:
-        anchos = [ancho_total / len(encabezados)] * len(encabezados)
-    else:
-        anchos = [ancho_total * a / 100 for a in anchos]
+_RE_DECIMALES_LARGOS = re.compile(r"(?<![\w.])(-?\d+)\.(\d{5,})(?:[eE]([+-]?\d+))?(?![\w])")
+_RE_NUMERICO = re.compile(r"^[\s<>~+\-]*\d[\d.,]*(?:[eE][+-]?\d+)?\s*%?$")
 
+
+def _formatear_numeros_largos(texto):
+    """Redondea cualquier numero con 5+ decimales dentro de un texto a 4
+    decimales (o a 3 cifras significativas en notacion cientifica si es
+    diminuto), p.ej. '0.8333333333333334' -> '0.8333'. Los numeros que ya
+    vienen con pocos decimales (p.ej. '4030.15') no se tocan."""
+    def _redondear(m):
+        try:
+            valor = float(m.group(0))
+        except ValueError:
+            return m.group(0)
+        if valor != 0 and abs(valor) < 1e-3:
+            return f"{valor:.3e}"
+        return f"{valor:.4f}"
+    return _RE_DECIMALES_LARGOS.sub(_redondear, texto)
+
+
+def _es_numerico(texto):
+    t = texto.strip()
+    return bool(t) and bool(_RE_NUMERICO.match(t))
+
+
+def _preparar_celda(c):
+    """Texto listo para el PDF: saneado y con los numeros largos redondeados."""
+    if c is None:
+        return ""
+    return _sanear(_formatear_numeros_largos(str(c)))
+
+
+def _lineas_celda(pdf, texto, ancho_texto, alto_linea):
+    if not texto:
+        return 1
+    return max(1, len(pdf.multi_cell(max(ancho_texto, 1), alto_linea, texto, split_only=True)))
+
+
+def _calcular_anchos(pdf, encabezados, filas, ancho_total, tam_fuente, pad):
+    """Ancho de cada columna segun su contenido real: ninguna palabra/numero
+    queda cortado a la mitad si hay forma de evitarlo."""
+    n = len(encabezados)
+    pref, minimo = [], []
+    for j in range(n):
+        pdf.set_font("Helvetica", "B", tam_fuente)
+        palabras_h = [w for h in [encabezados[j]] for w in h.split()] or [""]
+        min_h = max(pdf.get_string_width(w) for w in palabras_h)
+        pref_h = pdf.get_string_width(encabezados[j])
+        pdf.set_font("Helvetica", "", tam_fuente)
+        min_c, pref_c = 0.0, 0.0
+        for fila in filas:
+            t = fila[j]
+            pref_c = max(pref_c, pdf.get_string_width(t))
+            for w in (t.split() or [""]):
+                min_c = max(min_c, pdf.get_string_width(w))
+        # Un encabezado largo puede partirse en varias lineas (por eso solo
+        # su palabra mas larga cuenta para el minimo), pero el contenido de
+        # la columna manda para el ancho preferido.
+        minimo.append(max(min_h, min_c) + 2 * pad + 0.6)
+        pref.append(min(max(pref_c, min_h) + 2 * pad + 0.6, 95.0))
+    return pref, minimo
+
+
+def _repartir_anchos(pref, minimo, ancho_total):
+    if sum(minimo) > ancho_total:
+        return None  # ni siquiera entran los minimos: hay que achicar la letra
+    if sum(pref) <= ancho_total:
+        extra = ancho_total - sum(pref)
+        # el espacio sobrante se reparte proporcional al ancho preferido
+        return [p + extra * p / sum(pref) for p in pref]
+    # hay que comprimir: partimos de los minimos y repartimos el resto
+    # segun cuanto "quiere" crecer cada columna.
+    ganas = [max(p - m, 0.0) for p, m in zip(pref, minimo)]
+    libre = ancho_total - sum(minimo)
+    total_ganas = sum(ganas) or 1.0
+    return [m + libre * g / total_ganas for m, g in zip(minimo, ganas)]
+
+
+_RE_NUMERO_PURO = re.compile(r"^(-?\d+)(?:\.(\d+))?$")
+
+
+def _igualar_decimales(filas, n):
+    """En cada columna numerica, deja a todos los numeros con la misma
+    cantidad de decimales (0.6 -> 0.600 junto a 0.767), asi se leen parejos."""
+    for j in range(n):
+        celdas = [f[j].strip() for f in filas if f[j].strip()]
+        if not celdas:
+            continue
+        puros = [c for c in celdas if _RE_NUMERO_PURO.match(c)]
+        if len(puros) / len(celdas) < 0.7:
+            continue
+        max_dec = max(len(_RE_NUMERO_PURO.match(c).group(2) or "") for c in puros)
+        if max_dec == 0 or max_dec > 4:
+            continue
+        for f in filas:
+            c = f[j].strip()
+            m = _RE_NUMERO_PURO.match(c)
+            if m:
+                dec = len(m.group(2) or "")
+                if dec < max_dec:
+                    f[j] = (c if "." in c else c + ".") + "0" * (max_dec - dec)
+    return filas
+
+
+def _alineaciones(filas, n):
+    res = []
+    for j in range(n):
+        celdas = [f[j] for f in filas if f[j].strip()]
+        numericas = sum(_es_numerico(c) for c in celdas)
+        res.append("C" if celdas and numericas / len(celdas) >= 0.7 else "L")
+    return res
+
+
+def _dibujar_tabla(pdf, encabezados, filas, anchos_mm, tam_fuente, pad):
+    """Dibuja UNA tabla ya dimensionada. Maneja saltos de pagina (la fila
+    nunca se corta y el encabezado se repite) y encabezados multilinea."""
+    n = len(encabezados)
+    alineaciones = _alineaciones(filas, n)
+    alto_linea = max(3.6, tam_fuente * 0.52)
     margen_inferior = pdf.h - pdf.b_margin
+    x_inicio_tabla = pdf.l_margin
 
-    _dibujar_encabezado_tabla(pdf, encabezados, anchos)
+    def alto_encabezado():
+        pdf.set_font("Helvetica", "B", tam_fuente)
+        return max(_lineas_celda(pdf, h, w - 2 * pad, alto_linea)
+                   for h, w in zip(encabezados, anchos_mm)) * alto_linea + 2.4
+
+    def dibujar_encabezado():
+        alto = alto_encabezado()
+        pdf.set_font("Helvetica", "B", tam_fuente)
+        pdf.set_fill_color(*VERDE)
+        pdf.set_text_color(255, 255, 255)
+        y = pdf.get_y()
+        x = x_inicio_tabla
+        for h, w, al in zip(encabezados, anchos_mm, alineaciones):
+            pdf.rect(x, y, w, alto, style="F")
+            pdf.set_xy(x + pad, y + 1.2)
+            pdf.multi_cell(w - 2 * pad, alto_linea, h, border=0, align=al,
+                           new_x="RIGHT", new_y="TOP")
+            x += w
+        pdf.set_xy(x_inicio_tabla, y + alto)
+        pdf.set_text_color(0, 0, 0)
+
+    pdf.set_x(x_inicio_tabla)
+    # que el encabezado no quede huerfano al pie de la pagina
+    if pdf.get_y() + alto_encabezado() + alto_linea * 2 + 2.4 > margen_inferior:
+        pdf.add_page()
+    dibujar_encabezado()
 
     for i, fila in enumerate(filas):
-        textos = [_sanear(c) for c in fila]
-        alturas = []
-        for texto, w in zip(textos, anchos):
-            n_lineas = max(1, len(pdf.multi_cell(w, 5, texto, split_only=True)))
-            alturas.append(n_lineas * 5)
-        alto_fila = max(alturas)
+        pdf.set_font("Helvetica", "", tam_fuente)
+        alto_fila = max(_lineas_celda(pdf, t, w - 2 * pad, alto_linea)
+                        for t, w in zip(fila, anchos_mm)) * alto_linea + 2.4
 
         if pdf.get_y() + alto_fila > margen_inferior:
             pdf.add_page()
-            _dibujar_encabezado_tabla(pdf, encabezados, anchos)
+            dibujar_encabezado()
+            pdf.set_font("Helvetica", "", tam_fuente)
 
         pdf.set_fill_color(*(GRIS_CLARO if i % 2 else (255, 255, 255)))
-        x_inicio = pdf.get_x()
-        y_inicio = pdf.get_y()
-        for texto, w in zip(textos, anchos):
-            x = pdf.get_x()
-            y = pdf.get_y()
+        y = pdf.get_y()
+        x = x_inicio_tabla
+        for t, w, al in zip(fila, anchos_mm, alineaciones):
             pdf.rect(x, y, w, alto_fila, style="F")
-            pdf.set_xy(x, y)
-            pdf.multi_cell(w, 5, texto, border=0, align="L", new_x="RIGHT", new_y="TOP")
-        pdf.set_xy(x_inicio, y_inicio + alto_fila)
-    pdf.ln(2)
+            pdf.set_xy(x + pad, y + 1.2)
+            pdf.multi_cell(w - 2 * pad, alto_linea, t, border=0, align=al,
+                           new_x="RIGHT", new_y="TOP")
+            x += w
+        pdf.set_draw_color(215, 220, 218)       # linea fina separadora
+        pdf.set_line_width(0.15)
+        pdf.line(x_inicio_tabla, y + alto_fila, x_inicio_tabla + sum(anchos_mm), y + alto_fila)
+        pdf.set_xy(x_inicio_tabla, y + alto_fila)
+    pdf.set_font("Helvetica", "", 10.5)
+    pdf.ln(3)
+
+
+def tabla(pdf, encabezados, filas, anchos=None):
+    """Tabla para el PDF, pensada para que NUNCA queden numeros superpuestos
+    ni cortados a la mitad:
+
+    - Los numeros largos (p.ej. 0.8333333333333334) se redondean a 4 decimales.
+    - Los anchos se calculan segun el contenido real de cada columna (o se
+      usan los porcentajes de 'anchos' si el llamador los dio y alcanzan).
+    - Si no entra a una letra legible (>= 7.5 pt), la tabla se DIVIDE en
+      bloques de columnas repitiendo la primera columna (p.ej. el nombre del
+      modelo) en cada bloque, en vez de apretar todo ilegiblemente.
+    - Encabezados largos en varias lineas; columnas numericas centradas.
+    - Ninguna fila queda partida entre dos paginas; el encabezado se repite.
+    """
+    encabezados = [_preparar_celda(h) for h in encabezados]
+    filas = [[_preparar_celda(c) for c in fila] for fila in filas]
+    n = len(encabezados)
+    if n == 0:
+        return
+    for fila in filas:               # filas mas cortas que el encabezado
+        while len(fila) < n:
+            fila.append("")
+    filas = _igualar_decimales(filas, n)
+
+    ancho_total = 210 - 2 * 18
+    pad = 1.6
+
+    # 1) anchos dados por el llamador, si alcanzan para el contenido
+    if anchos is not None and len(anchos) == n:
+        candidatos = [ancho_total * a / 100 for a in anchos]
+        _, minimo = _calcular_anchos(pdf, encabezados, filas, ancho_total, 9.0, pad)
+        if all(c >= m - 0.01 for c, m in zip(candidatos, minimo)):
+            _dibujar_tabla(pdf, encabezados, filas, candidatos, 9.0, pad)
+            return
+
+    # 2) una sola tabla, con la letra mas grande que permita entrar entera
+    for tam in (9.0, 8.5, 8.0, 7.5):
+        pref, minimo = _calcular_anchos(pdf, encabezados, filas, ancho_total, tam, pad)
+        anchos_mm = _repartir_anchos(pref, minimo, ancho_total)
+        if anchos_mm is not None:
+            _dibujar_tabla(pdf, encabezados, filas, anchos_mm, tam, pad)
+            return
+
+    # 3) demasiado ancha: dividir en bloques de columnas (la 1ra se repite)
+    tam = 8.0
+    pref, minimo = _calcular_anchos(pdf, encabezados, filas, ancho_total, tam, pad)
+
+    def agrupar(limite):
+        grupos, resto = [], list(range(1, n))
+        while resto:
+            grupo, suma = [0], minimo[0]
+            while resto and suma + minimo[resto[0]] <= limite:
+                j = resto.pop(0)
+                grupo.append(j)
+                suma += minimo[j]
+            if len(grupo) == 1:      # ni una columna extra entra: forzamos 1
+                grupo.append(resto.pop(0))
+            grupos.append(grupo)
+        return grupos
+
+    grupos = agrupar(ancho_total)
+    if len(grupos) > 1:              # equilibrar: 8+7 en vez de 11+4
+        limite = minimo[0] + sum(minimo[1:]) / len(grupos) * 1.15
+        grupos = agrupar(min(max(limite, minimo[0] + max(minimo[1:])), ancho_total))
+
+    for g, grupo in enumerate(grupos):
+        if g > 0:
+            if pdf.get_y() + 38 > pdf.h - pdf.b_margin:   # cartel + encabezado + 2 filas
+                pdf.add_page()
+            pdf.set_font("Helvetica", "I", 8)
+            pdf.set_text_color(*GRIS)
+            pdf.cell(0, 4.5, "(table continued - remaining columns)", new_x="LMARGIN", new_y="NEXT")
+            pdf.set_text_color(0, 0, 0)
+        enc_g = [encabezados[j] for j in grupo]
+        filas_g = [[f[j] for j in grupo] for f in filas]
+        p_g, m_g = _calcular_anchos(pdf, enc_g, filas_g, ancho_total, tam, pad)
+        a_g = _repartir_anchos(p_g, m_g, ancho_total)
+        t_g = tam
+        if a_g is None:              # ultimo recurso: letra mas chica
+            for t_g in (7.5, 7.0, 6.5, 6.0):
+                p_g, m_g = _calcular_anchos(pdf, enc_g, filas_g, ancho_total, t_g, pad)
+                a_g = _repartir_anchos(p_g, m_g, ancho_total)
+                if a_g is not None:
+                    break
+            if a_g is None:
+                total_min = sum(m_g)
+                a_g = [m * ancho_total / total_min for m in m_g]
+        _dibujar_tabla(pdf, enc_g, filas_g, a_g, t_g, pad)
 
 
 def salto_pagina(pdf):
@@ -397,10 +654,10 @@ def seccion_ficha_modelo(pdf, ficha):
     lista_clave_valor(pdf, [(k, v) for k, v in entorno.items()])
 
 
-def generar_pdf_ficha_modelo(ficha, fig_extra=None, titulo_fig_extra=None):
+def generar_pdf_ficha_modelo(ficha, fig_extra=None, titulo_fig_extra=None, fecha_hora=None):
     """Arma un PDF autocontenido solo con la ficha de un modelo (para el
     botón de descarga individual). Devuelve el objeto ReportePDF."""
-    pdf = crear_reporte()
+    pdf = crear_reporte(fecha_hora=fecha_hora)
     titulo_portada(pdf, "Model card", f"ID: {ficha.get('id_trazabilidad', 'n/a')}")
     salto_pagina(pdf)
     seccion_ficha_modelo(pdf, ficha)
@@ -415,7 +672,7 @@ def generar_pdf_ficha_modelo(ficha, fig_extra=None, titulo_fig_extra=None):
 # GENERADOR GENÉRICO DE REPORTES (por secciones)
 # =============================================================================
 
-def generar_reporte(titulo, subtitulo, secciones):
+def generar_reporte(titulo, subtitulo, secciones, fecha_hora=None):
     """
     Arma un PDF a partir de una lista de "bloques" descriptivos, para no
     tener que repetir el armado del documento en cada pestaña de la app.
@@ -430,7 +687,7 @@ def generar_reporte(titulo, subtitulo, secciones):
       {"tipo": "salto_pagina"}
       {"tipo": "espacio"}
     """
-    pdf = crear_reporte()
+    pdf = crear_reporte(fecha_hora=fecha_hora)
     titulo_portada(pdf, titulo, subtitulo)
     salto_pagina(pdf)
 
@@ -448,6 +705,10 @@ def generar_reporte(titulo, subtitulo, secciones):
             tabla(pdf, bloque["encabezados"], bloque["filas"], anchos=bloque.get("anchos"))
         elif tipo == "imagen":
             imagen_desde_fig(pdf, bloque["fig"], ancho_mm=bloque.get("ancho_mm", 170))
+        elif tipo == "imagen_png":
+            imagen_desde_png(pdf, bloque["png"], ancho_mm=bloque.get("ancho_mm", 170))
+        elif tipo == "ficha":
+            seccion_ficha_modelo(pdf, bloque["ficha"])
         elif tipo == "salto_pagina":
             salto_pagina(pdf)
         elif tipo == "espacio":
