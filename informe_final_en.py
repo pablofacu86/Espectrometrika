@@ -472,6 +472,11 @@ def _b_clf(ss, desact, detalle):
         ("Independent test proportion", f"{int(ss.get('clf_prop_test', 0) * 100)}% ({ss.get('clf_metodo_split', 'n/a')})"),
         ("Variable selection", ss.get("clf_metodo_seleccion", "None")),
     ]}]
+    _run = ss.get("clf_run")
+    if _run and not _run.get("completo", True):
+        b.append({"tipo": "parrafo", "texto":
+                  "WARNING - INCOMPLETE RUN: the training was interrupted, so this section only covers the "
+                  "models that had finished."})
     mv = ss.get("clf_mascara_variables")
     if mv is not None:
         b.append({"tipo": "parrafo", "texto": f"Selected variables: {int(mv.sum())} of {len(mv)}."})
@@ -531,6 +536,11 @@ def _b_simca(ss):
         b.append({"tipo": "parrafo", "texto":
                   "NOTE: no independent test set was used - the figures below were measured on the same "
                   "samples used to fit each class model, so they are optimistic."})
+    _run = ss.get("simca_run")
+    if _run and not _run.get("completo", True):
+        b.append({"tipo": "parrafo", "texto":
+                  "WARNING - INCOMPLETE RUN: the training was interrupted, so this section only covers the "
+                  "models that had finished."})
     filas = []
     for c, m in modelos.items():
         miembro = true_ == c
@@ -558,6 +568,11 @@ def _b_reg(ss, desact, detalle):
         ("Independent test proportion", f"{int(ss.get('reg_prop_test', 0) * 100)}% ({ss.get('reg_metodo_split', 'n/a')})"),
         ("Variable selection", ss.get("reg_metodo_seleccion", "None")),
     ]}]
+    _run = ss.get("reg_run")
+    if _run and not _run.get("completo", True):
+        b.append({"tipo": "parrafo", "texto":
+                  "WARNING - INCOMPLETE RUN: the training was interrupted, so this section only covers the "
+                  "models that had finished."})
     mv = ss.get("reg_mascara_variables")
     if mv is not None:
         b.append({"tipo": "parrafo", "texto": f"Selected variables: {int(mv.sum())} of {len(mv)}."})

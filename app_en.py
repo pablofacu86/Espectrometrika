@@ -2508,54 +2508,112 @@ if _abierta(tabs[9]):
                                "(the test set is set aside first and never touched). Cross-validation figures can still be "
                                "slightly optimistic when selection is used; the independent test set is the honest estimate."
                                + (" ⚠ With no test set (0%), selection uses all the samples, so the CV figures are optimistic." if prop_test == 0 else ""))
-                if st.button("🚀 Train and evaluate (Classification)", disabled=len(modelos_elegidos) == 0):
-                    # Clear secondary results tied to the PREVIOUS set of trained models (a
-                    # statistical comparison or learning curve computed for models A/B/C would
-                    # otherwise linger on screen after retraining with a different D/E/F).
-                    for _clave in ["clf_pvalores", "clf_puntajes_cv", "clf_comparacion_metodo",
-                                    "clf_curva_aprendizaje", "clf_curva_modelo", "clf_ultima_ficha"]:
-                        st.session_state.pop(_clave, None)
-                    # The train/test split is decided FIRST: variable selection and hyperparameter optimization
-                    # then use ONLY the training samples, so nothing about the test set leaks into the model.
-                    _idx_split_clf = None
-                    if prop_test > 0:
-                        try:
-                            _idx_split_clf = mu.dividir_train_test(X_modelado, clases_activas, ids_activos, prop_test, True, 0, metodo_split)
-                        except Exception:
-                            _idx_split_clf = None
-                    _idx_tr_clf = _idx_split_clf[0] if _idx_split_clf is not None else np.arange(len(clases_activas))
-                    mascara_variables = None
-                    _msg_espera = "This may take a few minutes..." if (optimizar or metodo_seleccion in ("Boruta", "Genetic Algorithm")) else "Training..."
-                    with st.spinner(f"Selecting variables ({_msg_espera})" if metodo_seleccion != "None" else _msg_espera):
-                        if metodo_seleccion == "Boruta":
+                _run_clf = st.session_state.get("clf_run")
+                _incompleto_clf = bool(_run_clf) and not _run_clf.get("completo", True)
+                _valida_clf = _incompleto_clf and _run_clf.get("firma") == firma_modelos(_crop_mask_clf)
+                if _incompleto_clf:
+                    _hechos_clf = len([n_ for n_, r_ in _run_clf["resultados"].items() if "error" not in r_])
+                    st.warning(f"⏸ Incomplete run: {_hechos_clf} of {len(_run_clf['modelos'])} models finished (the run was interrupted). "
+                               + ("Click **Resume** to continue with the same settings, skipping the finished models."
+                                  if _valida_clf else "The data, preprocessing or crop changed since then, so it can't be resumed — train again."))
+                _ct1, _ct2, _ = st.columns([1.7, 1.6, 3])
+                _ent_clf = _ct1.button("🚀 Train and evaluate (Classification)", disabled=len(modelos_elegidos) == 0)
+                _rean_clf = _ct2.button("⏩ Resume interrupted run", key="clf_btn_resume", disabled=not _valida_clf,
+                                        help="Continues the interrupted run with the SAME settings it started with, skipping "
+                                             "the models that already finished (and not repeating the variable selection).")
+                if _ent_clf or _rean_clf:
+                    if _rean_clf:
+                        _r = _run_clf
+                        modelos_elegidos = list(_r["modelos"]); cv_folds = _r["cv_folds"]; prop_test = _r["prop_test"]
+                        metodo_split = _r["metodo_split"]; metodo_split_sel = _r["metodo_split_sel"]
+                        optimizar = _r["optimizar"]; metodo_opt = _r["metodo_opt"]; metodo_seleccion = _r["metodo_seleccion"]
+                        boruta_max_iter, boruta_alpha = _r["boruta_iter"], _r["boruta_alpha"]
+                        ga_poblacion, ga_generaciones = _r["ga_pob"], _r["ga_gen"]
+                        _idx_split_clf = _r["idx_split"]
+                    else:
+                        # Clear secondary results tied to the PREVIOUS set of trained models (a
+                        # statistical comparison or learning curve computed for models A/B/C would
+                        # otherwise linger on screen after retraining with a different D/E/F).
+                        for _clave in ["clf_pvalores", "clf_puntajes_cv", "clf_comparacion_metodo",
+                                        "clf_curva_aprendizaje", "clf_curva_modelo", "clf_ultima_ficha"]:
+                            st.session_state.pop(_clave, None)
+                        # The train/test split is decided FIRST: variable selection and hyperparameter optimization
+                        # then use ONLY the training samples, so nothing about the test set leaks into the model.
+                        _idx_split_clf = None
+                        if prop_test > 0:
                             try:
-                                mascara_variables = mu.seleccionar_variables_boruta(
-                                    X_modelado[_idx_tr_clf], clases_activas[_idx_tr_clf], es_clasificacion=True,
-                                    max_iter=boruta_max_iter, alpha=boruta_alpha,
+                                _idx_split_clf = mu.dividir_train_test(X_modelado, clases_activas, ids_activos, prop_test, True, 0, metodo_split)
+                            except Exception:
+                                _idx_split_clf = None
+                        # Everything needed to RESUME is kept in this record and updated after every model.
+                        st.session_state["clf_run"] = {
+                            "completo": False, "firma": firma_modelos(_crop_mask_clf), "modelos": list(modelos_elegidos),
+                            "cv_folds": cv_folds, "prop_test": prop_test, "metodo_split": metodo_split,
+                            "metodo_split_sel": metodo_split_sel, "optimizar": optimizar, "metodo_opt": metodo_opt,
+                            "metodo_seleccion": metodo_seleccion,
+                            "boruta_iter": boruta_max_iter if metodo_seleccion == "Boruta" else None,
+                            "boruta_alpha": boruta_alpha if metodo_seleccion == "Boruta" else None,
+                            "ga_pob": ga_poblacion if metodo_seleccion == "Genetic Algorithm" else None,
+                            "ga_gen": ga_generaciones if metodo_seleccion == "Genetic Algorithm" else None,
+                            "idx_split": _idx_split_clf, "mascara": None, "seleccion_hecha": False,
+                            "resultados": {}, "hp": {}, "desc": {},
+                        }
+                    _r = st.session_state["clf_run"]
+                    resultados, hiperparametros_optimos, descripcion_opt_usada = _r["resultados"], _r["hp"], _r["desc"]
+                    _idx_tr_clf = _idx_split_clf[0] if _idx_split_clf is not None else np.arange(len(clases_activas))
+
+                    def _guardar_clf():
+                        st.session_state["clf_resultados"] = resultados
+                        st.session_state["clf_mascara_variables"] = mascara_variables
+                        st.session_state["clf_descripcion_opt"] = descripcion_opt_usada
+                        st.session_state["clf_ids_usados"] = ids_activos
+                        st.session_state["clf_eje_usado"] = eje_modelado
+                        st.session_state["clf_pasos_pretratamiento"] = st.session_state.pasos_pretratamiento
+                        st.session_state["clf_hiperparametros"] = hiperparametros_optimos
+                        st.session_state["clf_espectro_promedio"] = X_modelado.mean(axis=0)
+                        st.session_state["clf_cv_folds"] = cv_folds
+                        st.session_state["clf_prop_test"] = prop_test
+                        st.session_state["clf_metodo_split"] = metodo_split_sel
+                        st.session_state["clf_metodo_seleccion"] = metodo_seleccion
+                        st.session_state["clf_n_muestras"] = X_modelado.shape[0]
+                        st.session_state["clf_firma"] = firma_modelos(_crop_mask_clf)
+                        st.session_state["clf_eje_completo"] = _eje_completo_clf
+                        st.session_state["clf_crop_mask"] = _crop_mask_clf
+                        st.session_state["clf_origen"] = "cropped" if _crop_mask_clf is not None else "full"
+                        st.session_state["clf_crop_desc"] = st.session_state.get("crop_desc_aplicada")
+
+                    mascara_variables = _r["mascara"]
+                    _msg_espera = "This may take a few minutes..." if (optimizar or metodo_seleccion in ("Boruta", "Genetic Algorithm")) else "Training..."
+                    with st.spinner(f"Selecting variables ({_msg_espera})" if (metodo_seleccion != "None" and not _r["seleccion_hecha"]) else _msg_espera):
+                        if not _r["seleccion_hecha"]:
+                            if metodo_seleccion == "Boruta":
+                                try:
+                                    mascara_variables = mu.seleccionar_variables_boruta(
+                                        X_modelado[_idx_tr_clf], clases_activas[_idx_tr_clf], es_clasificacion=True,
+                                        max_iter=boruta_max_iter, alpha=boruta_alpha,
+                                    )
+                                    if mascara_variables.sum() == 0:
+                                        st.warning("Boruta did not select any variable; using all of them.")
+                                        mascara_variables = None
+                                except Exception as e:
+                                    st.error(f"Boruta failed ({e}); using all variables.")
+                            elif metodo_seleccion == "Genetic Algorithm":
+                                from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+                                cv_ga = 3 if cv_folds == "LOO" else min(3, cv_folds)
+                                ga = mu.SeleccionGenetica(
+                                    LinearDiscriminantAnalysis(), es_clasificacion=True,
+                                    tam_poblacion=ga_poblacion, n_generaciones=ga_generaciones,
+                                    cv=cv_ga, random_state=0,
                                 )
-                                if mascara_variables.sum() == 0:
-                                    st.warning("Boruta did not select any variable; using all of them.")
-                                    mascara_variables = None
-                            except Exception as e:
-                                st.error(f"Boruta failed ({e}); using all variables.")
-                        elif metodo_seleccion == "Genetic Algorithm":
-                            from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
-                            cv_ga = 3 if cv_folds == "LOO" else min(3, cv_folds)
-                            ga = mu.SeleccionGenetica(
-                                LinearDiscriminantAnalysis(), es_clasificacion=True,
-                                tam_poblacion=ga_poblacion, n_generaciones=ga_generaciones,
-                                cv=cv_ga, random_state=0,
-                            )
-                            ga.fit(X_modelado[_idx_tr_clf], clases_activas[_idx_tr_clf])
-                            mascara_variables = ga.mejor_mascara_
+                                ga.fit(X_modelado[_idx_tr_clf], clases_activas[_idx_tr_clf])
+                                mascara_variables = ga.mejor_mascara_
+                            _r["mascara"], _r["seleccion_hecha"] = mascara_variables, True
 
                         X_sel = X_modelado[:, mascara_variables] if mascara_variables is not None else X_modelado
-
-                        resultados = {}
-                        hiperparametros_optimos = {}
-                        descripcion_opt_usada = {}
                         catalogo = mu.crear_clasificadores()
                         for nombre in modelos_elegidos:
+                            if nombre in resultados and "error" not in resultados[nombre]:
+                                continue                      # finished in the interrupted run: skip it
                             modelo = catalogo[nombre]
                             try:
                                 if optimizar and nombre in mu.GRILLAS_CLASIFICACION:
@@ -2572,25 +2630,11 @@ if _abierta(tabs[9]):
                                 )
                             except Exception as e:
                                 resultados[nombre] = {"error": str(e)}
-
-                    st.session_state["clf_resultados"] = resultados
-                    st.session_state["clf_mascara_variables"] = mascara_variables
-                    st.session_state["clf_descripcion_opt"] = descripcion_opt_usada
-                    st.session_state["clf_ids_usados"] = ids_activos
-                    st.session_state["clf_eje_usado"] = eje_modelado
-                    st.session_state["clf_pasos_pretratamiento"] = st.session_state.pasos_pretratamiento
-                    st.session_state["clf_hiperparametros"] = hiperparametros_optimos
-                    st.session_state["clf_espectro_promedio"] = X_modelado.mean(axis=0)
-                    st.session_state["clf_cv_folds"] = cv_folds
-                    st.session_state["clf_prop_test"] = prop_test
-                    st.session_state["clf_metodo_split"] = metodo_split_sel
-                    st.session_state["clf_metodo_seleccion"] = metodo_seleccion
-                    st.session_state["clf_n_muestras"] = X_modelado.shape[0]
-                    st.session_state["clf_firma"] = firma_modelos(_crop_mask_clf)
-                    st.session_state["clf_eje_completo"] = _eje_completo_clf
-                    st.session_state["clf_crop_mask"] = _crop_mask_clf
-                    st.session_state["clf_origen"] = "cropped" if _crop_mask_clf is not None else "full"
-                    st.session_state["clf_crop_desc"] = st.session_state.get("crop_desc_aplicada")
+                            _guardar_clf()                    # saved right away: an interruption keeps what is done
+                    _r["completo"] = True
+                    _guardar_clf()
+                    if _incompleto_clf:      # redraw: the 'incomplete run' banner above is now outdated
+                        st.rerun()
 
                 if "clf_resultados" in st.session_state:
                     resultados = st.session_state["clf_resultados"]
@@ -3012,20 +3056,46 @@ if _abierta(tabs[10]):
                     )
                     metodo_split_simca = "kennard_stone" if metodo_split_sel_simca.startswith("Kennard-Stone") else "random"
 
-                if st.button("🚀 Train SIMCA models (one per class)"):
-                    clases_unicas_simca = np.unique(clases_simca)
-                    if prop_test_simca > 0:
-                        idx_train_s, idx_test_s = mu.dividir_train_test(
-                            X_modelado_simca, clases_simca, ids_simca, prop_test_simca,
-                            es_clasificacion=True, metodo_split=metodo_split_simca,
-                        )
+                _run_simca = st.session_state.get("simca_run")
+                _incompleto_simca = bool(_run_simca) and not _run_simca.get("completo", True)
+                _valida_simca = _incompleto_simca and _run_simca.get("firma") == firma_modelos(_crop_mask_simca)
+                if _incompleto_simca:
+                    st.warning(f"⏸ Incomplete run: {len(_run_simca['modelos']) + len(_run_simca['errores'])} of {len(_run_simca['clases'])} "
+                               "class models finished (the run was interrupted). "
+                               + ("Click **Resume** to continue with the same settings, skipping the finished classes."
+                                  if _valida_simca else "The data, preprocessing or crop changed since then, so it can't be resumed — train again."))
+                _cs1, _cs2, _ = st.columns([1.9, 1.6, 3])
+                _ent_simca = _cs1.button("🚀 Train SIMCA models (one per class)")
+                _rean_simca = _cs2.button("⏩ Resume interrupted run", key="simca_btn_resume", disabled=not _valida_simca,
+                                          help="Continues the interrupted run with the SAME settings, skipping the classes already fitted.")
+                if _ent_simca or _rean_simca:
+                    if _rean_simca:
+                        _rs = _run_simca
+                        prop_test_simca = _rs["prop_test"]; metodo_split_sel_simca = _rs["metodo_split_sel"]
+                        varianza_objetivo_simca = _rs["varianza"]; alpha_simca = _rs["alpha"]
+                        idx_train_s, idx_test_s = _rs["idx_train"], _rs["idx_test"]
+                        clases_unicas_simca = np.array(_rs["clases"])
                     else:
-                        idx_train_s, idx_test_s = np.arange(len(clases_simca)), np.arange(len(clases_simca))
-
-                    modelos_simca = {}
-                    errores_simca = {}
+                        clases_unicas_simca = np.unique(clases_simca)
+                        if prop_test_simca > 0:
+                            idx_train_s, idx_test_s = mu.dividir_train_test(
+                                X_modelado_simca, clases_simca, ids_simca, prop_test_simca,
+                                es_clasificacion=True, metodo_split=metodo_split_simca,
+                            )
+                        else:
+                            idx_train_s, idx_test_s = np.arange(len(clases_simca)), np.arange(len(clases_simca))
+                        st.session_state["simca_run"] = {
+                            "completo": False, "firma": firma_modelos(_crop_mask_simca), "clases": list(clases_unicas_simca),
+                            "idx_train": idx_train_s, "idx_test": idx_test_s, "prop_test": prop_test_simca,
+                            "metodo_split_sel": metodo_split_sel_simca, "varianza": varianza_objetivo_simca,
+                            "alpha": alpha_simca, "modelos": {}, "errores": {},
+                        }
+                    _rs = st.session_state["simca_run"]
+                    modelos_simca, errores_simca = _rs["modelos"], _rs["errores"]
                     with st.spinner("Fitting one PCA model per class (this may take a few minutes)..."):
                         for c in clases_unicas_simca:
+                            if c in modelos_simca or c in errores_simca:
+                                continue                      # finished in the interrupted run: skip it
                             mask_c_train = (clases_simca[idx_train_s] == c)
                             X_c = X_modelado_simca[idx_train_s][mask_c_train]
                             try:
@@ -3066,6 +3136,9 @@ if _abierta(tabs[10]):
                     st.session_state["simca_crop_mask"] = _crop_mask_simca
                     st.session_state["simca_origen"] = "cropped" if _crop_mask_simca is not None else "full"
                     st.session_state["simca_crop_desc"] = st.session_state.get("crop_desc_aplicada")
+                    _rs["completo"] = True
+                    if _incompleto_simca:      # redraw: the 'incomplete run' banner above is now outdated
+                        st.rerun()
 
                 if "simca_modelos" in st.session_state:
                     modelos_simca = st.session_state["simca_modelos"]
@@ -3416,49 +3489,105 @@ if _abierta(tabs[11]):
                                "(the test set is set aside first and never touched). Cross-validation figures can still be "
                                "slightly optimistic when selection is used; the independent test set is the honest estimate."
                                + (" ⚠ With no test set (0%), selection uses all the samples, so the CV figures are optimistic." if prop_test_r == 0 else ""))
-                if st.button("🚀 Train and evaluate (Regression)", disabled=len(modelos_elegidos_r) == 0):
-                    for _clave in ["reg_pvalores", "reg_puntajes_cv", "reg_comparacion_metodo",
-                                    "reg_curva_aprendizaje", "reg_curva_modelo", "reg_ultima_ficha"]:
-                        st.session_state.pop(_clave, None)
-                    _idx_split_reg = None
-                    if prop_test_r > 0:
-                        try:
-                            _idx_split_reg = mu.dividir_train_test(X_reg, y_reg, ids_reg, prop_test_r, False, 0, metodo_split_r)
-                        except Exception:
-                            _idx_split_reg = None
-                    _idx_tr_reg = _idx_split_reg[0] if _idx_split_reg is not None else np.arange(len(y_reg))
-                    mascara_variables_r = None
-                    _msg_espera_r = "This may take a few minutes..." if (optimizar_r or metodo_seleccion_r in ("Boruta", "Genetic Algorithm")) else "Training..."
-                    with st.spinner(f"Selecting variables ({_msg_espera_r})" if metodo_seleccion_r != "None" else _msg_espera_r):
-                        if metodo_seleccion_r == "Boruta":
+                _run_reg = st.session_state.get("reg_run")
+                _incompleto_reg = bool(_run_reg) and not _run_reg.get("completo", True)
+                _valida_reg = _incompleto_reg and _run_reg.get("firma") == firma_modelos(_crop_mask_reg)
+                if _incompleto_reg:
+                    _hechos_reg = len([n_ for n_, r_ in _run_reg["resultados"].items() if "error" not in r_])
+                    st.warning(f"⏸ Incomplete run: {_hechos_reg} of {len(_run_reg['modelos'])} models finished (the run was interrupted). "
+                               + ("Click **Resume** to continue with the same settings, skipping the finished models."
+                                  if _valida_reg else "The data, preprocessing or crop changed since then, so it can't be resumed — train again."))
+                _rt1, _rt2, _ = st.columns([1.7, 1.6, 3])
+                _ent_reg = _rt1.button("🚀 Train and evaluate (Regression)", disabled=len(modelos_elegidos_r) == 0)
+                _rean_reg = _rt2.button("⏩ Resume interrupted run", key="reg_btn_resume", disabled=not _valida_reg,
+                                        help="Continues the interrupted run with the SAME settings it started with, skipping "
+                                             "the models that already finished (and not repeating the variable selection).")
+                if _ent_reg or _rean_reg:
+                    if _rean_reg:
+                        _rr = _run_reg
+                        modelos_elegidos_r = list(_rr["modelos"]); cv_folds_r = _rr["cv_folds"]; prop_test_r = _rr["prop_test"]
+                        metodo_split_r = _rr["metodo_split"]; metodo_split_sel_r = _rr["metodo_split_sel"]
+                        optimizar_r = _rr["optimizar"]; metodo_opt_r = _rr["metodo_opt"]; metodo_seleccion_r = _rr["metodo_seleccion"]
+                        boruta_max_iter_r, boruta_alpha_r = _rr["boruta_iter"], _rr["boruta_alpha"]
+                        ga_poblacion_r, ga_generaciones_r = _rr["ga_pob"], _rr["ga_gen"]
+                        _idx_split_reg = _rr["idx_split"]
+                    else:
+                        for _clave in ["reg_pvalores", "reg_puntajes_cv", "reg_comparacion_metodo",
+                                        "reg_curva_aprendizaje", "reg_curva_modelo", "reg_ultima_ficha"]:
+                            st.session_state.pop(_clave, None)
+                        _idx_split_reg = None
+                        if prop_test_r > 0:
                             try:
-                                mascara_variables_r = mu.seleccionar_variables_boruta(
-                                    X_reg[_idx_tr_reg], y_reg[_idx_tr_reg], es_clasificacion=False,
-                                    max_iter=boruta_max_iter_r, alpha=boruta_alpha_r,
+                                _idx_split_reg = mu.dividir_train_test(X_reg, y_reg, ids_reg, prop_test_r, False, 0, metodo_split_r)
+                            except Exception:
+                                _idx_split_reg = None
+                        st.session_state["reg_run"] = {
+                            "completo": False, "firma": firma_modelos(_crop_mask_reg), "modelos": list(modelos_elegidos_r),
+                            "cv_folds": cv_folds_r, "prop_test": prop_test_r, "metodo_split": metodo_split_r,
+                            "metodo_split_sel": metodo_split_sel_r, "optimizar": optimizar_r, "metodo_opt": metodo_opt_r,
+                            "metodo_seleccion": metodo_seleccion_r,
+                            "boruta_iter": boruta_max_iter_r if metodo_seleccion_r == "Boruta" else None,
+                            "boruta_alpha": boruta_alpha_r if metodo_seleccion_r == "Boruta" else None,
+                            "ga_pob": ga_poblacion_r if metodo_seleccion_r == "Genetic Algorithm" else None,
+                            "ga_gen": ga_generaciones_r if metodo_seleccion_r == "Genetic Algorithm" else None,
+                            "idx_split": _idx_split_reg, "mascara": None, "seleccion_hecha": False,
+                            "resultados": {}, "hp": {}, "desc": {},
+                        }
+                    _rr = st.session_state["reg_run"]
+                    resultados_r, hiperparametros_optimos_r, descripcion_opt_usada_r = _rr["resultados"], _rr["hp"], _rr["desc"]
+                    _idx_tr_reg = _idx_split_reg[0] if _idx_split_reg is not None else np.arange(len(y_reg))
+
+                    def _guardar_reg():
+                        st.session_state["reg_resultados"] = resultados_r
+                        st.session_state["reg_mascara_variables"] = mascara_variables_r
+                        st.session_state["reg_descripcion_opt"] = descripcion_opt_usada_r
+                        st.session_state["reg_eje_usado"] = eje_modelado
+                        st.session_state["reg_pasos_pretratamiento"] = st.session_state.pasos_pretratamiento
+                        st.session_state["reg_hiperparametros"] = hiperparametros_optimos_r
+                        st.session_state["reg_espectro_promedio"] = X_reg.mean(axis=0)
+                        st.session_state["reg_cv_folds"] = cv_folds_r
+                        st.session_state["reg_prop_test"] = prop_test_r
+                        st.session_state["reg_metodo_split"] = metodo_split_sel_r
+                        st.session_state["reg_metodo_seleccion"] = metodo_seleccion_r
+                        st.session_state["reg_n_muestras"] = X_reg.shape[0]
+                        st.session_state["reg_firma"] = firma_modelos(_crop_mask_reg)
+                        st.session_state["reg_eje_completo"] = _eje_completo_reg
+                        st.session_state["reg_crop_mask"] = _crop_mask_reg
+                        st.session_state["reg_origen"] = "cropped" if _crop_mask_reg is not None else "full"
+                        st.session_state["reg_crop_desc"] = st.session_state.get("crop_desc_aplicada")
+
+                    mascara_variables_r = _rr["mascara"]
+                    _msg_espera_r = "This may take a few minutes..." if (optimizar_r or metodo_seleccion_r in ("Boruta", "Genetic Algorithm")) else "Training..."
+                    with st.spinner(f"Selecting variables ({_msg_espera_r})" if (metodo_seleccion_r != "None" and not _rr["seleccion_hecha"]) else _msg_espera_r):
+                        if not _rr["seleccion_hecha"]:
+                            if metodo_seleccion_r == "Boruta":
+                                try:
+                                    mascara_variables_r = mu.seleccionar_variables_boruta(
+                                        X_reg[_idx_tr_reg], y_reg[_idx_tr_reg], es_clasificacion=False,
+                                        max_iter=boruta_max_iter_r, alpha=boruta_alpha_r,
+                                    )
+                                    if mascara_variables_r.sum() == 0:
+                                        st.warning("Boruta did not select any variable; using all of them.")
+                                        mascara_variables_r = None
+                                except Exception as e:
+                                    st.error(f"Boruta failed ({e}); using all variables.")
+                            elif metodo_seleccion_r == "Genetic Algorithm":
+                                from sklearn.linear_model import LinearRegression as _LR
+                                cv_ga_r = 3 if cv_folds_r == "LOO" else min(3, cv_folds_r)
+                                ga_r = mu.SeleccionGenetica(
+                                    _LR(), es_clasificacion=False,
+                                    tam_poblacion=ga_poblacion_r, n_generaciones=ga_generaciones_r,
+                                    cv=cv_ga_r, random_state=0,
                                 )
-                                if mascara_variables_r.sum() == 0:
-                                    st.warning("Boruta did not select any variable; using all of them.")
-                                    mascara_variables_r = None
-                            except Exception as e:
-                                st.error(f"Boruta failed ({e}); using all variables.")
-                        elif metodo_seleccion_r == "Genetic Algorithm":
-                            from sklearn.linear_model import LinearRegression as _LR
-                            cv_ga_r = 3 if cv_folds_r == "LOO" else min(3, cv_folds_r)
-                            ga_r = mu.SeleccionGenetica(
-                                _LR(), es_clasificacion=False,
-                                tam_poblacion=ga_poblacion_r, n_generaciones=ga_generaciones_r,
-                                cv=cv_ga_r, random_state=0,
-                            )
-                            ga_r.fit(X_reg[_idx_tr_reg], y_reg[_idx_tr_reg])
-                            mascara_variables_r = ga_r.mejor_mascara_
+                                ga_r.fit(X_reg[_idx_tr_reg], y_reg[_idx_tr_reg])
+                                mascara_variables_r = ga_r.mejor_mascara_
+                            _rr["mascara"], _rr["seleccion_hecha"] = mascara_variables_r, True
 
                         X_sel_r = X_reg[:, mascara_variables_r] if mascara_variables_r is not None else X_reg
-
-                        resultados_r = {}
-                        hiperparametros_optimos_r = {}
-                        descripcion_opt_usada_r = {}
                         catalogo_r = mu.crear_regresores()
                         for nombre in modelos_elegidos_r:
+                            if nombre in resultados_r and "error" not in resultados_r[nombre]:
+                                continue                      # finished in the interrupted run: skip it
                             modelo = catalogo_r[nombre]
                             try:
                                 if optimizar_r and nombre in mu.GRILLAS_REGRESION:
@@ -3475,24 +3604,11 @@ if _abierta(tabs[11]):
                                 )
                             except Exception as e:
                                 resultados_r[nombre] = {"error": str(e)}
-
-                    st.session_state["reg_resultados"] = resultados_r
-                    st.session_state["reg_mascara_variables"] = mascara_variables_r
-                    st.session_state["reg_descripcion_opt"] = descripcion_opt_usada_r
-                    st.session_state["reg_eje_usado"] = eje_modelado
-                    st.session_state["reg_pasos_pretratamiento"] = st.session_state.pasos_pretratamiento
-                    st.session_state["reg_hiperparametros"] = hiperparametros_optimos_r
-                    st.session_state["reg_espectro_promedio"] = X_reg.mean(axis=0)
-                    st.session_state["reg_cv_folds"] = cv_folds_r
-                    st.session_state["reg_prop_test"] = prop_test_r
-                    st.session_state["reg_metodo_split"] = metodo_split_sel_r
-                    st.session_state["reg_metodo_seleccion"] = metodo_seleccion_r
-                    st.session_state["reg_n_muestras"] = X_reg.shape[0]
-                    st.session_state["reg_firma"] = firma_modelos(_crop_mask_reg)
-                    st.session_state["reg_eje_completo"] = _eje_completo_reg
-                    st.session_state["reg_crop_mask"] = _crop_mask_reg
-                    st.session_state["reg_origen"] = "cropped" if _crop_mask_reg is not None else "full"
-                    st.session_state["reg_crop_desc"] = st.session_state.get("crop_desc_aplicada")
+                            _guardar_reg()
+                    _rr["completo"] = True
+                    _guardar_reg()
+                    if _incompleto_reg:      # redraw: the 'incomplete run' banner above is now outdated
+                        st.rerun()
 
                 if "reg_resultados" in st.session_state:
                     resultados_r = st.session_state["reg_resultados"]
