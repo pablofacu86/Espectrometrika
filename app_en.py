@@ -4578,8 +4578,9 @@ if _abierta(tabs[8]):
 
                 # ---------------- results
                 if _filas_s:
-                    _df_rank = sc.tabla_ranking(_filas_s, _tarea)
-                    _principal = sc.CLAVE_RANKING[_tarea][0]
+                    _tarea_res = (_estado_s or {}).get("tarea", _tarea)
+                    _df_rank = sc.tabla_ranking(_filas_s, _tarea_res)
+                    _principal = sc.CLAVE_RANKING[_tarea_res][0]
                     if _estado_s and not _estado_s.get("completo"):
                         st.warning(f"⏸ Incomplete run: {len(_filas_s)} of {_estado_s['total']} combinations finished "
                                    "(the run was interrupted). The ranking below covers only those — click Resume.")
@@ -4588,7 +4589,7 @@ if _abierta(tabs[8]):
                                    "that is different from the current one.")
                     st.markdown(f"#### Ranking — {_estado_s['tarea'] if _estado_s else _tarea}")
                     st.caption(f"Sorted by **{_principal}** "
-                               f"({'lower is better' if sc.CLAVE_RANKING[_tarea][1] else 'higher is better'}); ties are "
+                               f"({'lower is better' if sc.CLAVE_RANKING[_tarea_res][1] else 'higher is better'}); ties are "
                                "broken by the next test metric and then by the simpler model (fewer variables). "
                                "All training (CV) and test metrics are shown.")
                     _fmt = {c: "{:.3f}" for c in _df_rank.columns
@@ -4603,6 +4604,85 @@ if _abierta(tabs[8]):
                                         file_name="model_screening_ranking.csv", mime="text/csv", key="scr_dl_csv")
 
                     # ---- take a candidate to the other tabs
+                    st.markdown("#### 📊 What works best on average?")
+                    _mets_g = sc.metricas_disponibles(_tarea_res, _df_rank)
+                    _facs_g = sc.factores_con_variacion(_df_rank)
+                    if not _mets_g or not _facs_g:
+                        st.info("There is nothing to compare yet: only one level of every factor was tested, or no combination "
+                                "finished with a usable metric.")
+                    else:
+                        _g1, _g2 = st.columns([1.2, 2])
+                        _met_g = _g1.selectbox("Metric", _mets_g, key=f"scr_w_graf_met_{_tarea_res}",
+                                               help="Shown for every chart. For RMSE, lower is better.")
+                        _vista_g = _g2.radio("View", ["Bars (average)", "Pies (share of the top N)", "Heatmap (two factors)"],
+                                             horizontal=True, key="scr_w_graf_vista")
+                        _menor_g = sc.menor_es_mejor(_met_g)
+                        _incompleto = bool(_estado_s) and not _estado_s.get("completo")
+                        st.caption(("Lower is better. " if _menor_g else "Higher is better. ")
+                                   + "Every bar averages ALL the combinations that include that level, so when the screening is "
+                                     "complete each level is compared fairly across the other factors"
+                                   + (" — ⚠ this run is incomplete, so the comparison may be unbalanced." if _incompleto else "."))
+                        _verde, _gris = "#14B8A6", "#9DB4C0"
+                        if _vista_g.startswith("Bars"):
+                            _zoom = st.checkbox("Zoom the axis to the values (makes small differences easier to see)",
+                                                value=not _menor_g, key="scr_w_graf_zoom")
+                            _cols_g = st.columns(2)
+                            for _i, _f in enumerate(_facs_g):
+                                _res = sc.resumen_por_factor(_df_rank, _met_g, _f)
+                                if _res.empty:
+                                    continue
+                                _fig_g = go.Figure(go.Bar(
+                                    x=_res["mean"], y=_res[_f].astype(str), orientation="h",
+                                    error_x=dict(type="data", array=_res["std"], color="#555555", thickness=1.2),
+                                    marker_color=[_verde] + [_gris] * (len(_res) - 1),
+                                    text=[f"{v:.3f}" for v in _res["mean"]], textposition="outside", cliponaxis=False,
+                                    customdata=np.stack([_res["std"], _res["best"], _res["n"]], axis=-1),
+                                    hovertemplate="<b>%{y}</b><br>average: %{x:.4f}<br>std: %{customdata[0]:.4f}"
+                                                  "<br>best: %{customdata[1]:.4f}<br>combinations: %{customdata[2]:.0f}<extra></extra>"))
+                                _fig_g.update_yaxes(autorange="reversed")
+                                if _zoom:
+                                    _lo = float((_res["mean"] - _res["std"]).min())
+                                    _hi = float((_res["mean"] + _res["std"]).max())
+                                    _pad = max((_hi - _lo) * 0.25, 1e-6)
+                                    _fig_g.update_xaxes(range=[_lo - _pad, _hi + _pad])
+                                _fig_g.update_layout(title=f"By {_f.lower()}  (best on top)", xaxis_title=f"{_met_g} — mean ± std",
+                                                     height=max(230, 90 + 40 * len(_res)), margin=dict(l=10, r=30, t=50, b=40))
+                                _cols_g[_i % 2].plotly_chart(_fig_g, width='stretch')
+                        elif _vista_g.startswith("Pies"):
+                            _n_ok = int(_df_rank[_met_g].notna().sum())
+                            _n_top = st.slider("How many of the best combinations?", 3, max(3, min(30, _n_ok)),
+                                               min(10, max(3, _n_ok)), key="scr_w_graf_topn",
+                                               help="The pies show what share of the N best combinations (by the chosen metric) "
+                                                    "uses each level.")
+                            _cols_g = st.columns(2)
+                            for _i, _f in enumerate(_facs_g):
+                                _comp = sc.composicion_top(_df_rank, _met_g, _f, _n_top)
+                                if _comp.empty:
+                                    continue
+                                _fig_g = go.Figure(go.Pie(labels=list(_comp.index), values=list(_comp.values), hole=0.4,
+                                                          textinfo="label+percent", sort=False,
+                                                          marker=dict(colors=px.colors.qualitative.Set2[:len(_comp)])))
+                                _fig_g.update_layout(title=f"Top {_n_top} — by {_f.lower()}", height=330, showlegend=False,
+                                                     margin=dict(l=10, r=10, t=50, b=10))
+                                _cols_g[_i % 2].plotly_chart(_fig_g, width='stretch')
+                        else:
+                            if len(_facs_g) < 2:
+                                st.info("A heatmap needs at least two factors with more than one level.")
+                            else:
+                                _h1, _h2 = st.columns(2)
+                                _f_fil = _h1.selectbox("Rows", _facs_g, index=_facs_g.index("Preprocessing") if "Preprocessing" in _facs_g else 0,
+                                                       key="scr_w_graf_fil")
+                                _otros = [f for f in _facs_g if f != _f_fil]
+                                _f_col = _h2.selectbox("Columns", _otros, index=_otros.index("Algorithm") if "Algorithm" in _otros else 0,
+                                                       key="scr_w_graf_col")
+                                _piv = _df_rank.pivot_table(index=_f_fil, columns=_f_col, values=_met_g, aggfunc="mean")
+                                _fig_g = px.imshow(_piv, text_auto=".3f", aspect="auto",
+                                                   color_continuous_scale="RdYlGn_r" if _menor_g else "RdYlGn",
+                                                   labels=dict(color=_met_g))
+                                _fig_g.update_layout(height=max(300, 90 + 48 * len(_piv)), title=f"Average {_met_g}: {_f_fil.lower()} × {_f_col.lower()}",
+                                                     margin=dict(l=10, r=10, t=50, b=10))
+                                st.plotly_chart(_fig_g, width='stretch')
+
                     st.markdown("#### Refine a candidate")
                     _top = _df_rank[_df_rank.get("Error", pd.Series([np.nan] * len(_df_rank))).isna()].head(20)
                     if len(_top):

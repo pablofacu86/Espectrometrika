@@ -362,6 +362,64 @@ def _hiperparametros(ss, prefijo, nombre):
                 + list(hp.items())}]
 
 
+def _fig_screening_barras(df, tarea):
+    """Average (± std) of the main test metric for every level of every factor."""
+    metrica = sc.CLAVE_RANKING[tarea][0]
+    facs = sc.factores_con_variacion(df)
+    if not facs:
+        return None
+    filas = (len(facs) + 1) // 2
+    fig, axes = plt.subplots(filas, 2, figsize=(7.4, 2.6 * filas + 0.3), squeeze=False)
+    ejes = axes.flatten()
+    for ax, f in zip(ejes, facs):
+        g = sc.resumen_por_factor(df, metrica, f)
+        if g.empty:
+            ax.axis("off")
+            continue
+        y = np.arange(len(g))
+        ax.barh(y, g["mean"], xerr=g["std"], color=["#14B8A6"] + ["#9DB4C0"] * (len(g) - 1),
+                error_kw=dict(ecolor="#555555", lw=0.8, capsize=2))
+        ax.set_yticks(y)
+        ax.set_yticklabels([str(v)[:24] for v in g[f]], fontsize=7)
+        ax.invert_yaxis()
+        if not sc.menor_es_mejor(metrica):             # zoom, like the app's default view
+            lo, hi = (g["mean"] - g["std"]).min(), (g["mean"] + g["std"]).max()
+            pad = max((hi - lo) * 0.3, 1e-6)
+            ax.set_xlim(lo - pad, hi + pad)
+        for yi, v, sd in zip(y, g["mean"], g["std"]):
+            ax.text(v + sd, yi, f" {v:.3f}", va="center", fontsize=6.5)
+        ax.set_title(f"By {f.lower()}", fontsize=8.5)
+        ax.tick_params(axis="x", labelsize=7)
+        ax.set_xlabel(f"{metrica} (mean ± std)", fontsize=7)
+    for ax in ejes[len(facs):]:
+        ax.axis("off")
+    fig.tight_layout()
+    return fig
+
+
+def _fig_screening_tortas(df, tarea, n_top=10):
+    metrica = sc.CLAVE_RANKING[tarea][0]
+    facs = sc.factores_con_variacion(df)
+    if not facs:
+        return None
+    filas = (len(facs) + 1) // 2
+    fig, axes = plt.subplots(filas, 2, figsize=(7.4, 3.0 * filas), squeeze=False)
+    ejes = axes.flatten()
+    for ax, f in zip(ejes, facs):
+        comp = sc.composicion_top(df, metrica, f, n_top)
+        if comp.empty:
+            ax.axis("off")
+            continue
+        ax.pie(comp.values, labels=[str(k)[:22] for k in comp.index], autopct="%1.0f%%", startangle=90,
+               textprops=dict(fontsize=7), colors=list(plt.get_cmap("Set2").colors)[:len(comp)],
+               wedgeprops=dict(width=0.55, edgecolor="white"))
+        ax.set_title(f"Top {n_top} - by {f.lower()}", fontsize=8.5)
+    for ax in ejes[len(facs):]:
+        ax.axis("off")
+    fig.tight_layout()
+    return fig
+
+
 def _b_screening(ss, desact):
     est = ss.get("scr_estado") or {}
     tarea = est.get("tarea", "Classification")
@@ -386,6 +444,22 @@ def _b_screening(ss, desact):
     filas = [[("" if (isinstance(v, float) and np.isnan(v)) else (f"{v:.3f}" if isinstance(v, float) else v))
               for v in fila] for fila in top.itertuples(index=False)]
     b.append({"tipo": "tabla", "encabezados": cols, "filas": filas})
+    try:
+        metrica = sc.CLAVE_RANKING[tarea][0]
+        fb = _fig_screening_barras(df, tarea)
+        if fb is not None:
+            b.append({"tipo": "subtitulo", "texto": "Average performance by factor"})
+            b.append({"tipo": "parrafo", "texto":
+                      f"Mean +/- standard deviation of {metrica} over EVERY combination that includes each level "
+                      f"({'lower' if sc.menor_es_mejor(metrica) else 'higher'} is better); the best level is on top."
+                      + ("" if est.get("completo", True) else " NOTE: the run is incomplete, so the comparison may be unbalanced.")})
+            b.append({"tipo": "imagen", "fig": fb})
+            ft = _fig_screening_tortas(df, tarea, 10)
+            if ft is not None:
+                b.append({"tipo": "subtitulo", "texto": "Composition of the 10 best combinations"})
+                b.append({"tipo": "imagen", "fig": ft})
+    except Exception:
+        pass
     return b
 
 

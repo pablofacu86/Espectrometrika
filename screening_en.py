@@ -396,3 +396,54 @@ def tabla_ranking(filas, tarea):
     if "Error" in df.columns:
         cols.append("Error")
     return df[cols].reset_index(drop=True)
+
+
+# =============================================================================
+# 5) "WHICH FACTOR WORKS BEST ON AVERAGE?" — summaries behind the charts
+# =============================================================================
+
+FACTORES = ["Algorithm", "Preprocessing", "Variable selection", "Spectrum"]
+
+_METRICAS = {
+    "Classification": ["AUC (test)", "AUC (CV)", "Bal. accuracy (test)", "Bal. accuracy (CV)",
+                       "Accuracy (test)", "F1 macro (test)"],
+    "Regression": ["RMSE (test)", "RMSE (CV)", "R² (test)", "R² (CV)", "RPD (test)"],
+    "SIMCA": ["Efficiency (test)", "Sensitivity (test)", "Specificity (test)", "Exact assignment (test)"],
+}
+
+
+def metricas_disponibles(tarea, df=None):
+    mets = _METRICAS[tarea]
+    return [m for m in mets if df is None or (m in df.columns and df[m].notna().any())]
+
+
+def menor_es_mejor(metrica):
+    return metrica.startswith("RMSE")
+
+
+def factores_con_variacion(df):
+    """Factors for which more than one level was actually tested."""
+    return [f for f in FACTORES if f in df.columns and df[f].nunique() > 1]
+
+
+def resumen_por_factor(df, metrica, factor):
+    """Average (and spread) of 'metrica' for every level of 'factor', over ALL the
+    combinations that include that level, best level first."""
+    if factor not in df.columns or metrica not in df.columns:
+        return pd.DataFrame(columns=[factor, "mean", "std", "best", "n"])
+    d = df[[factor, metrica]].dropna()
+    if d.empty:
+        return pd.DataFrame(columns=[factor, "mean", "std", "best", "n"])
+    g = d.groupby(factor)[metrica].agg(["mean", "std", "min", "max", "count"]).reset_index()
+    g["std"] = g["std"].fillna(0.0)
+    g["best"] = g["min"] if menor_es_mejor(metrica) else g["max"]
+    g = g.rename(columns={"count": "n"}).drop(columns=["min", "max"])
+    return g.sort_values("mean", ascending=menor_es_mejor(metrica)).reset_index(drop=True)
+
+
+def composicion_top(df, metrica, factor, n_top):
+    """How many of the best n_top combinations (by 'metrica') use each level of 'factor'."""
+    if factor not in df.columns or metrica not in df.columns:
+        return pd.Series(dtype=int)
+    d = df.dropna(subset=[metrica]).sort_values(metrica, ascending=menor_es_mejor(metrica), kind="mergesort")
+    return d.head(int(n_top))[factor].astype(str).value_counts()
