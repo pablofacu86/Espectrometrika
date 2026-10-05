@@ -728,7 +728,7 @@ def dividir_train_test(X, y, ids, proporcion_test=0.2, es_clasificacion=True,
 
 
 def entrenar_evaluar_clasificacion(modelo, X, y, ids=None, cv=5, proporcion_test=0.0, random_state=0,
-                                    metodo_split="random"):
+                                    metodo_split="random", indices_split=None):
     """
     Full pipeline for classification:
     - If proporcion_test > 0: sets aside an independent test set (never used
@@ -742,7 +742,11 @@ def entrenar_evaluar_clasificacion(modelo, X, y, ids=None, cv=5, proporcion_test
     X, y = np.asarray(X), np.asarray(y)
     ids = np.asarray(ids) if ids is not None else np.arange(len(y)).astype(str)
 
-    if proporcion_test > 0:
+    if indices_split is not None:
+        # explicit (train, test) split decided BEFORE variable selection / hyperparameter
+        # optimization, so those steps could be fitted on the training samples only
+        idx_train, idx_test = np.asarray(indices_split[0]), np.asarray(indices_split[1])
+    elif proporcion_test > 0:
         idx_train, idx_test = dividir_train_test(X, y, ids, proporcion_test, True, random_state, metodo_split)
     else:
         idx_train, idx_test = np.arange(len(y)), None
@@ -789,12 +793,16 @@ def entrenar_evaluar_clasificacion(modelo, X, y, ids=None, cv=5, proporcion_test
 
 
 def entrenar_evaluar_regresion(modelo, X, y, ids=None, cv=5, proporcion_test=0.0, random_state=0,
-                                metodo_split="random"):
+                                metodo_split="random", indices_split=None):
     """Same as entrenar_evaluar_clasificacion, but for regression (split not stratified)."""
     X, y = np.asarray(X), np.asarray(y, dtype=float)
     ids = np.asarray(ids) if ids is not None else np.arange(len(y)).astype(str)
 
-    if proporcion_test > 0:
+    if indices_split is not None:
+        # explicit (train, test) split decided BEFORE variable selection / hyperparameter
+        # optimization, so those steps could be fitted on the training samples only
+        idx_train, idx_test = np.asarray(indices_split[0]), np.asarray(indices_split[1])
+    elif proporcion_test > 0:
         idx_train, idx_test = dividir_train_test(X, y, ids, proporcion_test, False, random_state, metodo_split)
     else:
         idx_train, idx_test = np.arange(len(y)), None

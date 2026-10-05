@@ -18,6 +18,10 @@ from sklearn.metrics import confusion_matrix
 
 import reporte_utils_en as ru
 import chemo_utils as cu
+try:
+    import screening_en as sc
+except ImportError:
+    sc = None
 
 # (group title, [(key, label), ...]) — order = order in the PDF
 GRUPOS = [
@@ -37,6 +41,7 @@ GRUPOS = [
         ("otros_umap", "UMAP"),
         ("otros_mcr", "MCR-ALS"),
     ]),
+    ("Model screening", [("screening", "Model screening ranking")]),
     ("Models", [
         ("clf", "Classification"),
         ("simca", "SIMCA"),
@@ -71,28 +76,41 @@ def _hay(ss, clave):
         return ss.get("reg_resultados") is not None
     if clave == "pred":
         return ss.get("pred_ultimo") is not None
+    if clave == "screening":
+        return bool(ss.get("scr_filas")) and sc is not None
     return False
+
+
+def _extra_crop(ss, clave_origen):
+    origen = ss.get(clave_origen, "full")
+    return (("crop", ss.get("crop_desc_aplicada") if origen == "cropped" else None, origen),)
 
 
 def _desactualizado(ss, clave, firma_actual):
     """True if the stored result was computed from a different data/preprocessing/
     outlier state than the current one (it keeps showing the old result)."""
+    firma_actual = tuple(firma_actual or ())
     try:
         if clave == "pca":
             f = ss.get("pca_firma")
-            return f is not None and f != firma_actual
+            return f is not None and tuple(f) != firma_actual + _extra_crop(ss, "pca_origen")
         if clave == "outliers":
             f = ss.get("outliers_firma")
-            return f is not None and tuple(f)[:len(firma_actual)] != tuple(firma_actual)
+            return f is not None and tuple(f)[:len(firma_actual) + 1] != firma_actual + _extra_crop(ss, "pca_origen")
         if clave in ("otros_loadings", "otros_ranking", "otros_corr"):
             f = ss.get(f"{clave}_firma")
             return f is not None and f[1] != ss.get("pca_firma")
         if clave in ("dendro", "otros_media", "otros_cm", "otros_tsne", "otros_umap", "otros_mcr"):
             f = ss.get(f"{clave}_firma")
-            return f is not None and f[0] != firma_actual
+            return f is not None and tuple(f[0]) != firma_actual + _extra_crop(ss, f"{clave}_origen")
         if clave in ("clf", "reg"):
             f = ss.get(f"{clave}_firma")
-            return f is not None and f != firma_actual
+            origen = ss.get(f"{clave}_origen", "full")
+            extra = (("crop", ss.get("crop_desc_aplicada") if origen == "cropped" else None, origen),)
+            return f is not None and tuple(f) != tuple(firma_actual) + extra
+        if clave == "screening":
+            est = ss.get("scr_estado") or {}
+            return bool(est) and est.get("firma") != (firma_actual, ss.get("crop_desc_aplicada"), est.get("tarea"))
     except Exception:
         return False
     return False
@@ -175,6 +193,7 @@ def _b_dataset(ss):
         ("Variables (original axis)", int(X.shape[1])),
         ("Samples excluded as outliers", n_excl),
         ("Preprocessing applied to the analysis", ss.get("pret_desc_aplicada", "none (raw spectra)")),
+        ("Spectral crop defined (Crop tab)", ss.get("crop_desc_aplicada") or "none"),
     ]
     clases = ss.get("clases")
     if clases is not None:
@@ -205,6 +224,7 @@ def _b_pca(ss, desact):
         ("Variables", int(ss["pca_X_input"].shape[1])),
         ("Components retained", n_comp),
         ("Cumulative explained variance", f"{np.cumsum(var)[n_comp - 1]:.1f}%"),
+        ("Spectrum used", ("Cropped: " + str(ss.get("pca_crop_desc"))) if ss.get("pca_origen") == "cropped" else "Full spectrum"),
     ]}]
     bloques.append({"tipo": "imagen", "fig": ru.fig_scree(var, n_comp_marcado=n_comp)})
     bloques.append({"tipo": "imagen", "fig": ru.fig_scores(sc, var, 1, 2, clases=clases, ids=ids)})
@@ -226,6 +246,7 @@ def _b_outliers(ss, desact):
     excl = ss.get("mascara_excluidas")
     bloques = _stale(desact) + [{"tipo": "clave_valor", "pares": [
         ("Samples analysed", len(ids)),
+        ("Spectrum used (same as the PCA)", ("Cropped: " + str(ss.get("pca_crop_desc"))) if ss.get("pca_origen") == "cropped" else "Full spectrum"),
         ("Principal components used", n_comp),
         ("Significance level (alpha)", alpha),
         ("T² limit", f"{T2_lim:.2f}"),
@@ -243,7 +264,8 @@ def _b_outliers(ss, desact):
 def _b_dendro(ss, desact):
     r = ss["dendro_resultado"]
     return _stale(desact) + [
-        {"tipo": "clave_valor", "pares": [("Linkage method", r["metodo"]), ("Samples", len(r["ids"]))]},
+        {"tipo": "clave_valor", "pares": [("Linkage method", r["metodo"]), ("Samples", len(r["ids"])),
+                                          ("Spectrum used", ("Cropped: " + str(r.get("crop_desc"))) if r.get("crop_desc") else "Full spectrum")]},
         {"tipo": "imagen", "fig": ru.fig_dendrograma(r["Z"], list(r["ids"]), clases=_como_texto(r["clases"]))},
     ]
 
@@ -338,6 +360,33 @@ def _hiperparametros(ss, prefijo, nombre):
             {"tipo": "clave_valor", "pares": [
                 ("Optimization method", ss.get(f"{prefijo}_descripcion_opt", {}).get(nombre, "n/a"))]
                 + list(hp.items())}]
+
+
+def _b_screening(ss, desact):
+    est = ss.get("scr_estado") or {}
+    tarea = est.get("tarea", "Classification")
+    df = sc.tabla_ranking(ss["scr_filas"], tarea)
+    b = _stale(desact) + [{"tipo": "clave_valor", "pares": [
+        ("Task", tarea), ("Signal type", est.get("tipo", "n/a")),
+        ("Combinations", f"{len(ss['scr_filas'])} of {est.get('total', len(ss['scr_filas']))}"
+                         + ("" if est.get("completo", True) else "  (INCOMPLETE run)")),
+        ("Ranked by", sc.CLAVE_RANKING[tarea][0] + (" (lower is better)" if sc.CLAVE_RANKING[tarea][1] else " (higher is better)")),
+        ("Run on", est.get("fecha", "n/a"))]},
+        {"tipo": "parrafo", "texto":
+         "Every combination used the same train/test split; variable selection was fitted on the training "
+         "samples only. Showing the best 20."}]
+    cols = {"Classification": ["Rank", "Spectrum", "Preprocessing", "Variable selection", "Algorithm", "n variables",
+                               "AUC (test)", "Bal. accuracy (test)", "AUC (CV)"],
+            "Regression": ["Rank", "Spectrum", "Preprocessing", "Variable selection", "Algorithm", "n variables",
+                           "RMSE (test)", "R² (test)", "RMSE (CV)"],
+            "SIMCA": ["Rank", "Spectrum", "Preprocessing", "Algorithm", "n variables", "Efficiency (test)",
+                      "Sensitivity (test)", "Specificity (test)", "Exact assignment (test)"]}[tarea]
+    cols = [c for c in cols if c in df.columns]
+    top = df[cols].head(20)
+    filas = [[("" if (isinstance(v, float) and np.isnan(v)) else (f"{v:.3f}" if isinstance(v, float) else v))
+              for v in fila] for fila in top.itertuples(index=False)]
+    b.append({"tipo": "tabla", "encabezados": cols, "filas": filas})
+    return b
 
 
 def _b_clf(ss, desact, detalle):
@@ -526,6 +575,8 @@ def construir_informe(ss, opciones, firma_actual):
                 b = _b_dendro(ss, desact)
             elif clave.startswith("otros_"):
                 b = _b_otros(ss, clave, desact)
+            elif clave == "screening":
+                b = _b_screening(ss, desact)
             elif clave == "clf":
                 b = _b_clf(ss, desact, opciones.get("clf_detalle", []))
             elif clave == "simca":

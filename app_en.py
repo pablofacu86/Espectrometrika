@@ -13,6 +13,7 @@ import io
 import os
 import re
 import sys
+import time
 import logging
 import hashlib
 import functools
@@ -35,6 +36,10 @@ from sklearn.decomposition import PCA
 import chemo_utils as cu
 import models_utils_en as mu
 import reporte_utils_en as ru
+try:
+    import screening_en as sc     # spectral crop + model screening
+except ImportError:
+    sc = None
 try:
     import informe_final_en as inf   # combined 'Final report' tab
 except ImportError:
@@ -594,12 +599,13 @@ def descripcion_firma(firma):
     return f"{n_muestras} samples × {n_vars} variables, {n_excluidas} excluded as outliers, preprocessing: {resumen_pasos}"
 
 
-def insignia_estado(clave_firma, etiqueta="This result"):
+def insignia_estado(clave_firma, etiqueta="This result", firma_actual=None):
     """Compares a stored fingerprint (session_state[clave_firma]) against the
     CURRENT one and renders a small badge. Returns True if the stored result
     is stale (current state has since changed) or doesn't exist yet."""
     firma_guardada = st.session_state.get(clave_firma)
-    firma_actual = firma_datos_activos()
+    if firma_actual is None:
+        firma_actual = firma_datos_activos()
     if firma_guardada is None:
         return True
     if firma_guardada == firma_actual:
@@ -626,7 +632,7 @@ def insignia_estado(clave_firma, etiqueta="This result"):
 
 CLAVES_PCA = ["pca_completo", "scores_completo", "cargas_completo", "autovalores",
               "var_explicada", "pca_X_input", "pca_ids", "pca_clases", "pca_eje",
-              "pca_firma", "scores", "cargas", "n_comp"]
+              "pca_firma", "pca_origen", "pca_crop_desc", "scores", "cargas", "n_comp"]
 CLAVES_OUTLIERS = ["outliers_resultado", "outliers_firma", "outliers_ids", "outliers_clases"]
 PREFIJOS_DERIVADOS_PCA = ("otros_loadings", "otros_ranking", "otros_corr")
 
@@ -662,6 +668,57 @@ def reiniciar_pretratamiento():
     st.session_state.pret_desc_aplicada = "none (raw spectra)"
     st.session_state.pret_propuesta_aplicada = repr(((), None))   # same fingerprint as "no steps"
     st.session_state.pop("pret_descarga", None)
+
+
+def firma_segun_origen(origen):
+    """Fingerprint of what an analysis depends on: the data/preprocessing/outlier state
+    PLUS (only if it used the cropped spectrum) the spectral crop."""
+    return (firma_datos_activos() or ()) + (
+        ("crop", st.session_state.get("crop_desc_aplicada") if origen == "cropped" else None, origen),)
+
+
+def firma_modelos(mascara_crop):
+    return firma_segun_origen("cropped" if mascara_crop is not None else "full")
+
+
+def elegir_espectro_modelado(X, eje, prefijo):
+    """Lets the user model on the full spectrum or on the cropped one (if a crop was
+    applied in the Crop tab). Returns (X, eje, mascara_crop | None, eje_completo)."""
+    crop = st.session_state.get("crop_aplicado")
+    mascara = sc.mascara_recorte(eje, crop) if (sc is not None and crop) else None
+    if mascara is None:
+        return X, eje, None, eje
+    opcion = st.radio(
+        "Spectrum used for the model", ["Full spectrum (no crop)", "Cropped spectrum"], index=1,
+        horizontal=True, key=f"{prefijo}_w_origen",
+        help="The crop is applied AFTER the preprocessing (which is always computed on the full "
+             "spectrum), so derivatives/smoothing are never distorted at the cut edges. Pick the "
+             "full spectrum to ignore the crop for this model.")
+    if opcion.startswith("Cropped"):
+        st.caption(f"✂️ Using {int(mascara.sum())} of {len(mascara)} variables — {sc.describir_recorte(crop)}.")
+        return X[:, mascara], eje[mascara], mascara, eje
+    return X, eje, None, eje
+
+
+def eje_y_mascara_para_guardar(prefijo, mascara_variables):
+    """Axis + variable mask to store with a saved model. If the model was trained on a
+    cropped spectrum, the FULL axis is stored together with a mask that combines the
+    crop and the variable selection — so Prediction can interpolate and preprocess on
+    the full axis first and only then keep the variables the model actually uses."""
+    mcrop = st.session_state.get(f"{prefijo}_crop_mask")
+    eje_comp = st.session_state.get(f"{prefijo}_eje_completo")
+    if mcrop is None or eje_comp is None:
+        return st.session_state[f"{prefijo}_eje_usado"], mascara_variables
+    combinada = np.zeros(len(eje_comp), dtype=bool)
+    idx = np.where(mcrop)[0]
+    combinada[idx[mascara_variables] if mascara_variables is not None else idx] = True
+    return eje_comp, combinada
+
+
+def desc_con_recorte(desc, prefijo):
+    if st.session_state.get(f"{prefijo}_crop_mask") is not None:
+        return f"{desc}  |  crop: {st.session_state.get(f'{prefijo}_crop_desc', 'yes')}"
+    return desc
 
 
 def barra_control(prefijo, firma_actual, etiqueta, texto_compute="▶ Compute"):
@@ -950,6 +1007,7 @@ with st.sidebar:
             if st.session_state.get("_X_firma") != _firma_X:
                 st.session_state["_X_firma"] = _firma_X
                 resetear_prefijo("pret_w_")
+                resetear_prefijo("crop_")
                 reiniciar_pretratamiento()
                 limpiar_resultados_exploratorios()
             if cambio_tamano:
@@ -1114,10 +1172,12 @@ _NOMBRES_TABS = [
     "🏠 Home",
     "📈 Data",
     "🧪 Preprocessing",
+    "✂️ Crop",
     "🧭 PCA",
     "🚩 Outliers",
     "🌳 Dendrogram",
     "🛠️ Other tools",
+    "🏁 Model screening",
     "🏷️ Classification",
     "🧬 SIMCA",
     "📉 Regression",
@@ -1545,19 +1605,21 @@ if _abierta(tabs[2]):
 # -----------------------------------------------------------------------
 # TAB: PCA
 # -----------------------------------------------------------------------
-if _abierta(tabs[3]):
-    with tabs[3]:
+if _abierta(tabs[4]):
+    with tabs[4]:
         st.subheader("Principal Component Analysis (PCA)")
 
         ids_actuales, _, clases_actuales = datos_activos()
         X_pca_input = st.session_state.X_pret[indice_activo()]
+        X_pca_input, _eje_pca_in, _crop_mask_pca, _ = elegir_espectro_modelado(
+            X_pca_input, np.array(st.session_state.numeros_onda_pret, dtype=float), "pca")
         n_muestras, n_variables = X_pca_input.shape
         n_comp_max = min(n_muestras - 1, n_variables)
 
         if n_comp_max < 2:
             st.warning("At least 3 samples are needed to compute PCA.")
         else:
-            esta_desactualizado_pca = insignia_estado("pca_firma", "The PCA result")
+            esta_desactualizado_pca = insignia_estado("pca_firma", "The PCA result", firma_actual=firma_modelos(_crop_mask_pca))
             col_btn_pca, col_clr_pca, _ = st.columns([1.4, 1, 4])
             if col_clr_pca.button("🧹 Clear", key="btn_limpiar_pca",
                                   disabled=st.session_state.get("pca_completo") is None,
@@ -1581,10 +1643,12 @@ if _abierta(tabs[3]):
                         # using live data/ids anywhere downstream would silently mismatch
                         # this frozen result in length. Outliers (next tab) reuses all of this.
                         st.session_state.pca_X_input = X_pca_input
-                        st.session_state.pca_eje = np.array(st.session_state.numeros_onda_pret)
+                        st.session_state.pca_eje = np.array(_eje_pca_in)
+                        st.session_state.pca_origen = "cropped" if _crop_mask_pca is not None else "full"
+                        st.session_state.pca_crop_desc = st.session_state.get("crop_desc_aplicada") if _crop_mask_pca is not None else None
                         st.session_state.pca_ids = ids_actuales
                         st.session_state.pca_clases = clases_actuales
-                        st.session_state.pca_firma = firma_datos_activos()
+                        st.session_state.pca_firma = firma_modelos(_crop_mask_pca)
                     st.rerun()
 
             if st.session_state.get("pca_completo") is None:
@@ -1694,8 +1758,8 @@ if _abierta(tabs[3]):
 # -----------------------------------------------------------------------
 # TAB: OUTLIERS
 # -----------------------------------------------------------------------
-if _abierta(tabs[4]):
-    with tabs[4]:
+if _abierta(tabs[5]):
+    with tabs[5]:
         st.subheader("Outlier detection: Hotelling's T² and Q residual")
 
         if st.session_state.get("pca_completo") is None:
@@ -1713,13 +1777,16 @@ if _abierta(tabs[4]):
             n_comp = min(st.session_state.get("n_comp", 3), len(st.session_state.var_explicada))
             n_muestras = X_pca_input.shape[0]
 
+            st.caption("Outlier detection is built on the PCA result, so it uses the same spectrum as the PCA: "
+                       + (f"✂️ cropped ({st.session_state.get('pca_crop_desc')})." if st.session_state.get("pca_origen") == "cropped"
+                          else "the full spectrum. (Change it in the PCA tab and click Update there.)"))
             col1, col2, col3 = st.columns(3)
             alpha = col1.slider("Significance level (alpha)", 0.01, 0.10, 0.05, step=0.01)
             criterio = col2.selectbox("Criterion to flag outliers",
                                        ["T² and Q (both, conservative)", "T² or Q (either, aggressive)",
                                         "T² only", "Q only"])
 
-            _firma_outliers_actual = firma_datos_activos() + (n_comp, alpha)
+            _firma_outliers_actual = firma_segun_origen(st.session_state.get("pca_origen", "full")) + (n_comp, alpha)
             _resultado_outliers_previo = st.session_state.get("outliers_resultado")
             esta_desactualizado_out = (
                 _resultado_outliers_previo is None
@@ -1902,11 +1969,13 @@ if _abierta(tabs[4]):
 # -----------------------------------------------------------------------
 # TAB: DENDROGRAM
 # -----------------------------------------------------------------------
-if _abierta(tabs[5]):
-    with tabs[5]:
+if _abierta(tabs[6]):
+    with tabs[6]:
         st.subheader("Hierarchical Cluster Analysis (HCA)")
 
         X_hca_vivo = st.session_state.X_pret[indice_activo()]
+        X_hca_vivo, _eje_den, _crop_mask_den, _ = elegir_espectro_modelado(
+            X_hca_vivo, np.array(st.session_state.numeros_onda_pret, dtype=float), "dendro")
 
         if X_hca_vivo.shape[0] < 3:
             st.warning("At least 3 samples are needed.")
@@ -1929,7 +1998,7 @@ if _abierta(tabs[5]):
                                help="Only changes how the SAME result is drawn — it doesn't recompute anything.")
 
             # --- Compute / Update / Clear -------------------------------------------------
-            if barra_control("dendro", (firma_datos_activos(), metodo), "The dendrogram"):
+            if barra_control("dendro", (firma_modelos(_crop_mask_den), metodo), "The dendrogram"):
                 ids_snap, _, clases_snap = datos_activos()
                 with st.spinner("Clustering..."):
                     Z_nuevo = _calcular_linkage_cacheado(X_hca_vivo, metodo)
@@ -1938,8 +2007,10 @@ if _abierta(tabs[5]):
                 st.session_state["dendro_resultado"] = {
                     "Z": Z_nuevo, "X": X_hca_vivo, "ids": ids_snap, "clases": clases_snap,
                     "metodo": metodo, "figuras": {},
+                "crop_desc": st.session_state.get("crop_desc_aplicada") if _crop_mask_den is not None else None,
                 }
-                st.session_state["dendro_firma"] = (firma_datos_activos(), metodo)
+                st.session_state["dendro_firma"] = (firma_modelos(_crop_mask_den), metodo)
+                st.session_state["dendro_origen"] = "cropped" if _crop_mask_den is not None else "full"
                 st.rerun()
 
             res = st.session_state.get("dendro_resultado")
@@ -1949,7 +2020,8 @@ if _abierta(tabs[5]):
             else:
                 Z, X_hca, ids, clases = res["Z"], res["X"], res["ids"], res["clases"]
                 st.caption(f"Showing the result computed with the **{res['metodo']}** linkage on "
-                           f"{X_hca.shape[0]} samples.")
+                           f"{X_hca.shape[0]} samples"
+                           + (f", on the ✂️ cropped spectrum ({res['crop_desc']})." if res.get("crop_desc") else "."))
 
                 mapa_color_clase = None
                 if clases is not None:
@@ -2003,8 +2075,8 @@ if _abierta(tabs[5]):
 # -----------------------------------------------------------------------
 # TAB: OTHER TOOLS
 # -----------------------------------------------------------------------
-if _abierta(tabs[6]):
-    with tabs[6]:
+if _abierta(tabs[7]):
+    with tabs[7]:
         st.subheader("Other exploratory analysis tools")
         st.caption("Pick a tool, adjust its settings, and click **Compute**. Nothing runs until you do, "
                    "and each tool keeps its own result until you clear it.")
@@ -2023,6 +2095,9 @@ if _abierta(tabs[6]):
         )
 
         tiene_pca = st.session_state.get("pca_completo") is not None
+        _crop_mask_otros = None
+        if herramienta not in ("Loadings vs wavenumber", "Ranking of important variables", "Loadings correlation plot"):
+            X_vivo, eje_vivo, _crop_mask_otros, _ = elegir_espectro_modelado(X_vivo, eje_vivo, "otros")
         n_vivo = X_vivo.shape[0]
 
         if herramienta in ["Loadings vs wavenumber", "Ranking of important variables",
@@ -2133,7 +2208,7 @@ if _abierta(tabs[6]):
             if clases_vivo is None:
                 st.warning("Define classes in the left-hand panel first.")
             else:
-                _firma = (firma_datos_activos(),)
+                _firma = (firma_modelos(_crop_mask_otros),)
                 if barra_control("otros_media", _firma, "This plot"):
                     por_clase = {}
                     for cl in np.unique(clases_vivo):
@@ -2141,6 +2216,7 @@ if _abierta(tabs[6]):
                         por_clase[str(cl)] = (X_vivo[mask].mean(axis=0), X_vivo[mask].std(axis=0))
                     st.session_state["otros_media_resultado"] = {"por_clase": por_clase, "eje": eje_vivo.copy()}
                     st.session_state["otros_media_firma"] = _firma
+                    st.session_state["otros_media_origen"] = "cropped" if _crop_mask_otros is not None else "full"
                     st.rerun()
                 r = st.session_state.get("otros_media_resultado")
                 if r is None:
@@ -2164,7 +2240,7 @@ if _abierta(tabs[6]):
         elif herramienta == "Clustermap (heatmap + dendrogram)":
             metodo_cm = st.selectbox("Linkage method", ["ward", "average", "complete", "single"],
                                       key="otros_w_cm_metodo")
-            _firma = (firma_datos_activos(), metodo_cm)
+            _firma = (firma_modelos(_crop_mask_otros), metodo_cm)
             if barra_control("otros_cm", _firma, "This clustermap"):
                 with st.spinner("Clustering and drawing the heatmap — this can take a while with many samples..."):
                     df_heat = pd.DataFrame(X_vivo, index=ids_vivo, columns=np.round(eje_vivo, 0))
@@ -2176,6 +2252,7 @@ if _abierta(tabs[6]):
                     plt.close(fig_cm.fig)
                 st.session_state["otros_cm_resultado"] = {"png": _buf.getvalue(), "metodo": metodo_cm}
                 st.session_state["otros_cm_firma"] = _firma
+                st.session_state["otros_cm_origen"] = "cropped" if _crop_mask_otros is not None else "full"
                 st.rerun()
             r = st.session_state.get("otros_cm_resultado")
             if r is None:
@@ -2189,7 +2266,7 @@ if _abierta(tabs[6]):
         elif herramienta == "t-SNE":
             perplejidad = st.slider("Perplexity", 5, min(50, max(6, n_vivo - 1)), min(30, max(6, n_vivo - 1)),
                                      key="otros_w_tsne_perp")
-            _firma = (firma_datos_activos(), perplejidad)
+            _firma = (firma_modelos(_crop_mask_otros), perplejidad)
             if barra_control("otros_tsne", _firma, "This t-SNE map"):
                 from sklearn.manifold import TSNE
                 with st.spinner("Computing t-SNE..."):
@@ -2197,6 +2274,7 @@ if _abierta(tabs[6]):
                                random_state=0).fit_transform(X_vivo)
                 st.session_state["otros_tsne_resultado"] = {"emb": emb, "ids": ids_vivo, "clases": clases_vivo}
                 st.session_state["otros_tsne_firma"] = _firma
+                st.session_state["otros_tsne_origen"] = "cropped" if _crop_mask_otros is not None else "full"
                 st.rerun()
             r = st.session_state.get("otros_tsne_resultado")
             if r is None:
@@ -2218,12 +2296,13 @@ if _abierta(tabs[6]):
             else:
                 vecinos = st.slider("n_neighbors", 2, min(50, max(3, n_vivo - 1)), min(15, max(3, n_vivo - 1)),
                                      key="otros_w_umap_vecinos")
-                _firma = (firma_datos_activos(), vecinos)
+                _firma = (firma_modelos(_crop_mask_otros), vecinos)
                 if barra_control("otros_umap", _firma, "This UMAP map"):
                     with st.spinner("Computing UMAP..."):
                         emb = umap.UMAP(n_components=2, n_neighbors=vecinos, random_state=0).fit_transform(X_vivo)
                     st.session_state["otros_umap_resultado"] = {"emb": emb, "ids": ids_vivo, "clases": clases_vivo}
                     st.session_state["otros_umap_firma"] = _firma
+                    st.session_state["otros_umap_origen"] = "cropped" if _crop_mask_otros is not None else "full"
                     st.rerun()
                 r = st.session_state.get("otros_umap_resultado")
                 if r is None:
@@ -2250,13 +2329,14 @@ if _abierta(tabs[6]):
                      "explain the mixtures well; too many risk splitting real signal into noise-fitting "
                      "components. Try comparing the lack-of-fit for a couple of values.",
             )
-            _firma = (firma_datos_activos(), n_componentes_mcr)
+            _firma = (firma_modelos(_crop_mask_otros), n_componentes_mcr)
             if barra_control("otros_mcr", _firma, "This MCR-ALS result", texto_compute="▶ Run MCR-ALS"):
                 with st.spinner("Running alternating least squares..."):
                     resultado_mcr = cu.mcr_als(X_vivo, n_componentes=n_componentes_mcr, max_iter=200)
                 st.session_state["otros_mcr_resultado"] = {
                     "res": resultado_mcr, "ids": ids_vivo, "eje": eje_vivo.copy(), "n": n_componentes_mcr}
                 st.session_state["otros_mcr_firma"] = _firma
+                st.session_state["otros_mcr_origen"] = "cropped" if _crop_mask_otros is not None else "full"
                 st.rerun()
             r = st.session_state.get("otros_mcr_resultado")
             if r is None:
@@ -2300,8 +2380,8 @@ if _abierta(tabs[6]):
 # -----------------------------------------------------------------------
 # TAB: CLASSIFICATION
 # -----------------------------------------------------------------------
-if _abierta(tabs[7]):
-    with tabs[7]:
+if _abierta(tabs[9]):
+    with tabs[9]:
         st.subheader("Supervised classification")
         if st.button("🔄 Reset this tab", key="reset_clf",
                      help="Clears all trained models, metrics, and plots from this tab, so you can "
@@ -2312,6 +2392,7 @@ if _abierta(tabs[7]):
         ids_activos, X_activo_clf, clases_activas = datos_activos()
         X_modelado = st.session_state.X_pret[indice_activo()]
         eje_modelado = st.session_state.numeros_onda_pret
+        X_modelado, eje_modelado, _crop_mask_clf, _eje_completo_clf = elegir_espectro_modelado(X_modelado, eje_modelado, "clf")
 
         if clases_activas is None:
             st.warning("Define classes in the left-hand panel (Data tab) to run a classification.")
@@ -2420,8 +2501,13 @@ if _abierta(tabs[7]):
                     ga_generaciones = c2.slider("Generations", 5, 50, 15, key="ga_gen_clf")
 
                 if st.session_state.get("clf_resultados") is not None:
-                    insignia_estado("clf_firma", "This trained classification model")
+                    insignia_estado("clf_firma", "This trained classification model", firma_actual=firma_modelos(_crop_mask_clf))
 
+                if metodo_seleccion != "None" or optimizar:
+                    st.caption("ℹ️ Variable selection and hyperparameter optimization use ONLY the training samples "
+                               "(the test set is set aside first and never touched). Cross-validation figures can still be "
+                               "slightly optimistic when selection is used; the independent test set is the honest estimate."
+                               + (" ⚠ With no test set (0%), selection uses all the samples, so the CV figures are optimistic." if prop_test == 0 else ""))
                 if st.button("🚀 Train and evaluate (Classification)", disabled=len(modelos_elegidos) == 0):
                     # Clear secondary results tied to the PREVIOUS set of trained models (a
                     # statistical comparison or learning curve computed for models A/B/C would
@@ -2429,13 +2515,22 @@ if _abierta(tabs[7]):
                     for _clave in ["clf_pvalores", "clf_puntajes_cv", "clf_comparacion_metodo",
                                     "clf_curva_aprendizaje", "clf_curva_modelo", "clf_ultima_ficha"]:
                         st.session_state.pop(_clave, None)
+                    # The train/test split is decided FIRST: variable selection and hyperparameter optimization
+                    # then use ONLY the training samples, so nothing about the test set leaks into the model.
+                    _idx_split_clf = None
+                    if prop_test > 0:
+                        try:
+                            _idx_split_clf = mu.dividir_train_test(X_modelado, clases_activas, ids_activos, prop_test, True, 0, metodo_split)
+                        except Exception:
+                            _idx_split_clf = None
+                    _idx_tr_clf = _idx_split_clf[0] if _idx_split_clf is not None else np.arange(len(clases_activas))
                     mascara_variables = None
                     _msg_espera = "This may take a few minutes..." if (optimizar or metodo_seleccion in ("Boruta", "Genetic Algorithm")) else "Training..."
                     with st.spinner(f"Selecting variables ({_msg_espera})" if metodo_seleccion != "None" else _msg_espera):
                         if metodo_seleccion == "Boruta":
                             try:
                                 mascara_variables = mu.seleccionar_variables_boruta(
-                                    X_modelado, clases_activas, es_clasificacion=True,
+                                    X_modelado[_idx_tr_clf], clases_activas[_idx_tr_clf], es_clasificacion=True,
                                     max_iter=boruta_max_iter, alpha=boruta_alpha,
                                 )
                                 if mascara_variables.sum() == 0:
@@ -2451,7 +2546,7 @@ if _abierta(tabs[7]):
                                 tam_poblacion=ga_poblacion, n_generaciones=ga_generaciones,
                                 cv=cv_ga, random_state=0,
                             )
-                            ga.fit(X_modelado, clases_activas)
+                            ga.fit(X_modelado[_idx_tr_clf], clases_activas[_idx_tr_clf])
                             mascara_variables = ga.mejor_mascara_
 
                         X_sel = X_modelado[:, mascara_variables] if mascara_variables is not None else X_modelado
@@ -2465,7 +2560,7 @@ if _abierta(tabs[7]):
                             try:
                                 if optimizar and nombre in mu.GRILLAS_CLASIFICACION:
                                     modelo, mejores_params, _, desc_opt = mu.optimizar_hiperparametros(
-                                        modelo, mu.GRILLAS_CLASIFICACION[nombre], X_sel, clases_activas,
+                                        modelo, mu.GRILLAS_CLASIFICACION[nombre], X_sel[_idx_tr_clf], clases_activas[_idx_tr_clf],
                                         es_clasificacion=True, cv=cv_folds, metodo=metodo_opt,
                                     )
                                     hiperparametros_optimos[nombre] = mejores_params
@@ -2473,6 +2568,7 @@ if _abierta(tabs[7]):
                                 resultados[nombre] = mu.entrenar_evaluar_clasificacion(
                                     modelo, X_sel, clases_activas, ids=ids_activos,
                                     cv=cv_folds, proporcion_test=prop_test, metodo_split=metodo_split,
+                                    indices_split=_idx_split_clf,
                                 )
                             except Exception as e:
                                 resultados[nombre] = {"error": str(e)}
@@ -2490,7 +2586,11 @@ if _abierta(tabs[7]):
                     st.session_state["clf_metodo_split"] = metodo_split_sel
                     st.session_state["clf_metodo_seleccion"] = metodo_seleccion
                     st.session_state["clf_n_muestras"] = X_modelado.shape[0]
-                    st.session_state["clf_firma"] = firma_datos_activos()
+                    st.session_state["clf_firma"] = firma_modelos(_crop_mask_clf)
+                    st.session_state["clf_eje_completo"] = _eje_completo_clf
+                    st.session_state["clf_crop_mask"] = _crop_mask_clf
+                    st.session_state["clf_origen"] = "cropped" if _crop_mask_clf is not None else "full"
+                    st.session_state["clf_crop_desc"] = st.session_state.get("crop_desc_aplicada")
 
                 if "clf_resultados" in st.session_state:
                     resultados = st.session_state["clf_resultados"]
@@ -2814,7 +2914,7 @@ if _abierta(tabs[7]):
                                 "n_variables_totales": int(X_modelado.shape[1]),
                                 "n_variables_usadas": int(mascara_variables.sum()) if mascara_variables is not None else int(X_modelado.shape[1]),
                                 "descripcion_y": desc_y,
-                                "pretratamiento_desc": " -> ".join(p[0] for p in st.session_state["clf_pasos_pretratamiento"]) or "none",
+                                "pretratamiento_desc": desc_con_recorte(" -> ".join(p[0] for p in st.session_state["clf_pasos_pretratamiento"]) or "none", "clf"),
                                 "seleccion_variables_desc": st.session_state["clf_metodo_seleccion"],
                                 "hiperparametros": hiperparametros_optimos.get(nombre_detalle, {}),
                                 "metodo_optimizacion": descripcion_opt_usada.get(nombre_detalle, "none"),
@@ -2826,8 +2926,8 @@ if _abierta(tabs[7]):
                             st.session_state.modelos_guardados[nombre_guardado] = {
                                 "tipo": "classification",
                                 "modelo": res["modelo_final"],
-                                "mascara_variables": mascara_variables,
-                                "numeros_onda": st.session_state["clf_eje_usado"],
+                                "mascara_variables": eje_y_mascara_para_guardar("clf", mascara_variables)[1],
+                                "numeros_onda": eje_y_mascara_para_guardar("clf", mascara_variables)[0],
                                 "pasos_pretratamiento": st.session_state["clf_pasos_pretratamiento"],
                                 "ficha": ficha,
                             }
@@ -2849,8 +2949,8 @@ if _abierta(tabs[7]):
 
 # TAB: SIMCA
 # -----------------------------------------------------------------------
-if _abierta(tabs[8]):
-    with tabs[8]:
+if _abierta(tabs[10]):
+    with tabs[10]:
         st.subheader("SIMCA — Soft Independent Modeling of Class Analogies")
         if st.button("🔄 Reset this tab", key="reset_simca",
                      help="Clears all trained SIMCA models and results from this tab, so you can start "
@@ -2868,6 +2968,7 @@ if _abierta(tabs[8]):
         ids_simca, _, clases_simca = datos_activos()
         X_modelado_simca = st.session_state.X_pret[indice_activo()]
         eje_modelado_simca = st.session_state.numeros_onda_pret
+        X_modelado_simca, eje_modelado_simca, _crop_mask_simca, _eje_completo_simca = elegir_espectro_modelado(X_modelado_simca, eje_modelado_simca, "simca")
 
         if clases_simca is None:
             st.warning("Define classes in the left-hand panel (Data tab) to build SIMCA models.")
@@ -2961,6 +3062,10 @@ if _abierta(tabs[8]):
                     st.session_state["simca_varianza_objetivo"] = varianza_objetivo_simca
                     st.session_state["simca_n_muestras"] = int(X_modelado_simca.shape[0])
                     st.session_state["simca_validacion_es_calibracion"] = (prop_test_simca == 0)
+                    st.session_state["simca_eje_completo"] = _eje_completo_simca
+                    st.session_state["simca_crop_mask"] = _crop_mask_simca
+                    st.session_state["simca_origen"] = "cropped" if _crop_mask_simca is not None else "full"
+                    st.session_state["simca_crop_desc"] = st.session_state.get("crop_desc_aplicada")
 
                 if "simca_modelos" in st.session_state:
                     modelos_simca = st.session_state["simca_modelos"]
@@ -3116,8 +3221,8 @@ if _abierta(tabs[8]):
                         st.session_state.modelos_guardados[nombre_guardado_simca] = {
                             "tipo": "simca",
                             "modelo": modelos_simca,
-                            "mascara_variables": None,
-                            "numeros_onda": st.session_state["simca_eje_usado"],
+                            "mascara_variables": eje_y_mascara_para_guardar("simca", None)[1],
+                            "numeros_onda": eje_y_mascara_para_guardar("simca", None)[0],
                             "pasos_pretratamiento": st.session_state["simca_pasos_pretratamiento"],
                             "ficha": ficha_simca,
                         }
@@ -3126,8 +3231,8 @@ if _abierta(tabs[8]):
 
 # TAB: REGRESSION
 # -----------------------------------------------------------------------
-if _abierta(tabs[9]):
-    with tabs[9]:
+if _abierta(tabs[11]):
+    with tabs[11]:
         st.subheader("Supervised regression")
         if st.button("🔄 Reset this tab", key="reset_reg",
                      help="Clears all trained models, metrics, and plots from this tab, so you can "
@@ -3193,6 +3298,7 @@ if _abierta(tabs[9]):
             ids_activos, _, _ = datos_activos()
             X_modelado = st.session_state.X_pret[indice_activo()]
             eje_modelado = st.session_state.numeros_onda_pret
+            X_modelado, eje_modelado, _crop_mask_reg, _eje_completo_reg = elegir_espectro_modelado(X_modelado, eje_modelado, "reg")
             y_activos = st.session_state.valores_y[indice_activo()]
 
             mask_validos = ~np.isnan(y_activos)
@@ -3303,19 +3409,31 @@ if _abierta(tabs[9]):
                     ga_generaciones_r = c2.slider("Generations", 5, 50, 15, key="ga_gen_reg")
 
                 if st.session_state.get("reg_resultados") is not None:
-                    insignia_estado("reg_firma", "This trained regression model")
+                    insignia_estado("reg_firma", "This trained regression model", firma_actual=firma_modelos(_crop_mask_reg))
 
+                if metodo_seleccion_r != "None" or optimizar_r:
+                    st.caption("ℹ️ Variable selection and hyperparameter optimization use ONLY the training samples "
+                               "(the test set is set aside first and never touched). Cross-validation figures can still be "
+                               "slightly optimistic when selection is used; the independent test set is the honest estimate."
+                               + (" ⚠ With no test set (0%), selection uses all the samples, so the CV figures are optimistic." if prop_test_r == 0 else ""))
                 if st.button("🚀 Train and evaluate (Regression)", disabled=len(modelos_elegidos_r) == 0):
                     for _clave in ["reg_pvalores", "reg_puntajes_cv", "reg_comparacion_metodo",
                                     "reg_curva_aprendizaje", "reg_curva_modelo", "reg_ultima_ficha"]:
                         st.session_state.pop(_clave, None)
+                    _idx_split_reg = None
+                    if prop_test_r > 0:
+                        try:
+                            _idx_split_reg = mu.dividir_train_test(X_reg, y_reg, ids_reg, prop_test_r, False, 0, metodo_split_r)
+                        except Exception:
+                            _idx_split_reg = None
+                    _idx_tr_reg = _idx_split_reg[0] if _idx_split_reg is not None else np.arange(len(y_reg))
                     mascara_variables_r = None
                     _msg_espera_r = "This may take a few minutes..." if (optimizar_r or metodo_seleccion_r in ("Boruta", "Genetic Algorithm")) else "Training..."
                     with st.spinner(f"Selecting variables ({_msg_espera_r})" if metodo_seleccion_r != "None" else _msg_espera_r):
                         if metodo_seleccion_r == "Boruta":
                             try:
                                 mascara_variables_r = mu.seleccionar_variables_boruta(
-                                    X_reg, y_reg, es_clasificacion=False,
+                                    X_reg[_idx_tr_reg], y_reg[_idx_tr_reg], es_clasificacion=False,
                                     max_iter=boruta_max_iter_r, alpha=boruta_alpha_r,
                                 )
                                 if mascara_variables_r.sum() == 0:
@@ -3331,7 +3449,7 @@ if _abierta(tabs[9]):
                                 tam_poblacion=ga_poblacion_r, n_generaciones=ga_generaciones_r,
                                 cv=cv_ga_r, random_state=0,
                             )
-                            ga_r.fit(X_reg, y_reg)
+                            ga_r.fit(X_reg[_idx_tr_reg], y_reg[_idx_tr_reg])
                             mascara_variables_r = ga_r.mejor_mascara_
 
                         X_sel_r = X_reg[:, mascara_variables_r] if mascara_variables_r is not None else X_reg
@@ -3345,7 +3463,7 @@ if _abierta(tabs[9]):
                             try:
                                 if optimizar_r and nombre in mu.GRILLAS_REGRESION:
                                     modelo, mejores_params_r, _, desc_opt_r = mu.optimizar_hiperparametros(
-                                        modelo, mu.GRILLAS_REGRESION[nombre], X_sel_r, y_reg,
+                                        modelo, mu.GRILLAS_REGRESION[nombre], X_sel_r[_idx_tr_reg], y_reg[_idx_tr_reg],
                                         es_clasificacion=False, cv=cv_folds_r, metodo=metodo_opt_r,
                                     )
                                     hiperparametros_optimos_r[nombre] = mejores_params_r
@@ -3353,6 +3471,7 @@ if _abierta(tabs[9]):
                                 resultados_r[nombre] = mu.entrenar_evaluar_regresion(
                                     modelo, X_sel_r, y_reg, ids=ids_reg,
                                     cv=cv_folds_r, proporcion_test=prop_test_r, metodo_split=metodo_split_r,
+                                    indices_split=_idx_split_reg,
                                 )
                             except Exception as e:
                                 resultados_r[nombre] = {"error": str(e)}
@@ -3369,7 +3488,11 @@ if _abierta(tabs[9]):
                     st.session_state["reg_metodo_split"] = metodo_split_sel_r
                     st.session_state["reg_metodo_seleccion"] = metodo_seleccion_r
                     st.session_state["reg_n_muestras"] = X_reg.shape[0]
-                    st.session_state["reg_firma"] = firma_datos_activos()
+                    st.session_state["reg_firma"] = firma_modelos(_crop_mask_reg)
+                    st.session_state["reg_eje_completo"] = _eje_completo_reg
+                    st.session_state["reg_crop_mask"] = _crop_mask_reg
+                    st.session_state["reg_origen"] = "cropped" if _crop_mask_reg is not None else "full"
+                    st.session_state["reg_crop_desc"] = st.session_state.get("crop_desc_aplicada")
 
                 if "reg_resultados" in st.session_state:
                     resultados_r = st.session_state["reg_resultados"]
@@ -3731,7 +3854,7 @@ if _abierta(tabs[9]):
                                 "n_variables_totales": int(X_reg.shape[1]),
                                 "n_variables_usadas": int(mascara_variables_r.sum()) if mascara_variables_r is not None else int(X_reg.shape[1]),
                                 "descripcion_y": desc_y_r,
-                                "pretratamiento_desc": " -> ".join(p[0] for p in st.session_state["reg_pasos_pretratamiento"]) or "none",
+                                "pretratamiento_desc": desc_con_recorte(" -> ".join(p[0] for p in st.session_state["reg_pasos_pretratamiento"]) or "none", "reg"),
                                 "seleccion_variables_desc": st.session_state["reg_metodo_seleccion"],
                                 "hiperparametros": hiperparametros_optimos_r.get(nombre_detalle_r, {}),
                                 "metodo_optimizacion": descripcion_opt_usada_r.get(nombre_detalle_r, "none"),
@@ -3743,8 +3866,8 @@ if _abierta(tabs[9]):
                             st.session_state.modelos_guardados[nombre_guardado_r] = {
                                 "tipo": "regression",
                                 "modelo": res["modelo_final"],
-                                "mascara_variables": mascara_variables_r,
-                                "numeros_onda": st.session_state["reg_eje_usado"],
+                                "mascara_variables": eje_y_mascara_para_guardar("reg", mascara_variables_r)[1],
+                                "numeros_onda": eje_y_mascara_para_guardar("reg", mascara_variables_r)[0],
                                 "pasos_pretratamiento": st.session_state["reg_pasos_pretratamiento"],
                                 "ficha": ficha_r,
                                 # Cross-validation RMSE, kept to build an approximate 95% prediction
@@ -3772,8 +3895,8 @@ if _abierta(tabs[9]):
 
 # TAB: PREDICTION ON NEW SAMPLES
 # -----------------------------------------------------------------------
-if _abierta(tabs[10]):
-    with tabs[10]:
+if _abierta(tabs[12]):
+    with tabs[12]:
         st.subheader("Prediction on new samples")
 
         with st.expander("💾 Save/load models on your PC (to use them another day)"):
@@ -4032,8 +4155,8 @@ if _abierta(tabs[10]):
 # -----------------------------------------------------------------------
 # TAB: FINAL REPORT
 # -----------------------------------------------------------------------
-if _abierta(tabs[11]):
-    with tabs[11]:
+if _abierta(tabs[13]):
+    with tabs[13]:
         st.subheader("Final report")
         if inf is None:
             st.error("The report module `informe_final_en.py` is missing. Upload it to the same "
@@ -4136,3 +4259,371 @@ if _abierta(tabs[11]):
                               help="Removes the built report from memory."):
                     st.session_state.pop("informe_final", None)
                     st.rerun()
+
+# -----------------------------------------------------------------------
+# TAB: CROP
+# -----------------------------------------------------------------------
+if _abierta(tabs[3]):
+    with tabs[3]:
+        st.subheader("Crop spectral regions")
+        if sc is None:
+            st.error("The module `screening_en.py` is missing. Upload it to the same folder as "
+                     "`app_en.py` to enable this tab.")
+        else:
+            _eje_c = np.array(st.session_state.numeros_onda_pret, dtype=float)
+            _X_c = st.session_state.X_pret[indice_activo()]
+            _aplicado = st.session_state.get("crop_aplicado")
+
+            st.caption(
+                "Remove the regions that distort your spectra (for example the water band near "
+                "1600 cm⁻¹ in FT-MIR) — or keep only the regions you trust. The crop is applied "
+                "**after** the preprocessing, which is always computed on the full spectrum, so "
+                "derivatives and smoothing are never disturbed by the cut edges. It then becomes an "
+                "option in the model tabs (full vs. cropped spectrum) and in Model screening.")
+
+            if "crop_borrador" not in st.session_state:
+                st.session_state["crop_borrador"] = []
+            _borrador = st.session_state["crop_borrador"]
+
+            _modo = st.radio("The regions I define are the ones to…", ["Keep", "Remove"], horizontal=True,
+                             key="crop_w_modo",
+                             help="Keep: only these regions are used and everything else is dropped. "
+                                  "Remove: these regions are dropped and the rest is used.")
+
+            # ---- add a region ---------------------------------------------------------
+            _rango = float(_eje_c.max() - _eje_c.min())
+            _paso = max(_rango / 1000, 1e-6)
+            _c1, _c2, _c3 = st.columns([1, 1, 1])
+            _desde = _c1.number_input("From", min_value=float(_eje_c.min()), max_value=float(_eje_c.max()),
+                                      value=float(_eje_c.min()), step=_paso, format="%.3f", key="crop_w_desde")
+            _hasta = _c2.number_input("To", min_value=float(_eje_c.min()), max_value=float(_eje_c.max()),
+                                      value=float(_eje_c.min() + 0.1 * _rango), step=_paso, format="%.3f",
+                                      key="crop_w_hasta")
+            _c3.markdown("&nbsp;")
+            if _c3.button("➕ Add this region", key="crop_btn_agregar"):
+                if _desde == _hasta:
+                    st.warning("'From' and 'To' are the same value.")
+                else:
+                    _borrador.append([float(min(_desde, _hasta)), float(max(_desde, _hasta))])
+                    st.rerun()
+
+            # quick presets (only those that fall inside this axis)
+            _atajos = [("Water bending band (1600–1700)", 1600, 1700), ("CO₂ (2280–2400)", 2280, 2400),
+                       ("Water O–H stretch (3000–3700)", 3000, 3700)]
+            _atajos = [a for a in _atajos if _eje_c.min() <= a[1] and a[2] <= _eje_c.max()]
+            if _atajos:
+                st.caption("Quick add (typical mid-infrared regions):")
+                _cols_a = st.columns(len(_atajos))
+                for _col, (_nom, _lo, _hi) in zip(_cols_a, _atajos):
+                    if _col.button(_nom, key=f"crop_btn_atajo_{_lo}"):
+                        _borrador.append([float(_lo), float(_hi)])
+                        st.rerun()
+
+            # ---- current list of regions ------------------------------------------------
+            if _borrador:
+                st.markdown("**Regions defined**")
+                for _i, (_lo, _hi) in enumerate(list(_borrador)):
+                    _cc1, _cc2 = st.columns([5, 1])
+                    _cc1.markdown(f"{_i + 1}. {_lo:g} – {_hi:g}")
+                    if _cc2.button("✖", key=f"crop_btn_del_{_i}", help="Remove this region from the list"):
+                        _borrador.pop(_i)
+                        st.rerun()
+                if st.button("🗑️ Remove all regions from the list", key="crop_btn_vaciar"):
+                    st.session_state["crop_borrador"] = []
+                    st.rerun()
+            else:
+                st.info("No regions yet. Add them above, or draw a box over the plot below.")
+
+            # ---- preview plot (drag a box on it to pick a region) ----------------------
+            _propuesta = {"modo": _modo.lower(), "regiones": [tuple(r) for r in _borrador]}
+            _mask_prev = sc.mascara_recorte(_eje_c, _propuesta)
+            _fig_c = go.Figure()
+            _idx_show = np.linspace(0, _X_c.shape[0] - 1, min(40, _X_c.shape[0])).astype(int)
+            for _i in _idx_show:
+                _fig_c.add_trace(go.Scatter(x=_eje_c, y=_X_c[_i], mode="lines", showlegend=False,
+                                            line=dict(width=0.6, color="rgba(120,120,120,0.35)"),
+                                            hoverinfo="skip"))
+            _fig_c.add_trace(go.Scatter(x=_eje_c, y=_X_c.mean(axis=0), mode="lines", name="Mean spectrum",
+                                        line=dict(color="#0B3D54", width=2)))
+            if _mask_prev is not None:
+                _quitado = ~_mask_prev
+                _lim = np.flatnonzero(np.diff(np.concatenate([[0], _quitado.astype(int), [0]])))
+                for _a, _b in zip(_lim[::2], _lim[1::2]):
+                    _fig_c.add_vrect(x0=_eje_c[_a], x1=_eje_c[_b - 1], fillcolor="red", opacity=0.18,
+                                     line_width=0)
+            _fig_c.update_layout(height=430, xaxis_title="Axis", yaxis_title="Signal",
+                                 title="Spectra after preprocessing — red = removed by the crop (preview)",
+                                 dragmode="select")
+            if _eje_c[0] > _eje_c[-1]:
+                _fig_c.update_xaxes(autorange="reversed")
+            _cajas = []
+            try:
+                _evento = st.plotly_chart(_fig_c, on_select="rerun", selection_mode="box",
+                                          key="crop_w_grafico", width='stretch')
+                _cajas = list(getattr(getattr(_evento, "selection", None), "box", None) or [])
+            except TypeError:                       # older Streamlit: plot without selection
+                st.plotly_chart(_fig_c, width='stretch')
+            if _cajas:
+                _xs = _cajas[0].get("x") or []
+                if len(_xs) == 2:
+                    _s_lo, _s_hi = float(min(_xs)), float(max(_xs))
+                    st.success(f"Selected on the plot: {_s_lo:.3f} – {_s_hi:.3f}")
+                    if st.button("➕ Add the selected range as a region", key="crop_btn_agregar_sel"):
+                        _borrador.append([_s_lo, _s_hi])
+                        st.rerun()
+            else:
+                st.caption("Tip: drag a box over the plot to select a region, then click 'Add the selected range'.")
+
+            # ---- summary + apply / reset ---------------------------------------------
+            if _borrador and _mask_prev is None:
+                st.warning("With these regions nothing would be cropped (all variables kept) or fewer "
+                           "than 2 variables would remain. Adjust the regions or the Keep/Remove choice.")
+            elif _mask_prev is not None:
+                st.caption(f"Preview: **{int(_mask_prev.sum())}** of {len(_mask_prev)} variables kept "
+                           f"({100 * _mask_prev.mean():.0f}%).")
+                with st.expander("Preview of the cropped spectra (gaps = removed regions)"):
+                    _fig_v = go.Figure()
+                    for _i in _idx_show[:15]:
+                        _fig_v.add_trace(go.Scatter(x=_eje_c, y=np.where(_mask_prev, _X_c[_i], np.nan),
+                                                    mode="lines", showlegend=False, line=dict(width=0.8)))
+                    _fig_v.update_layout(height=320, xaxis_title="Axis", yaxis_title="Signal")
+                    if _eje_c[0] > _eje_c[-1]:
+                        _fig_v.update_xaxes(autorange="reversed")
+                    st.plotly_chart(_fig_v, width='stretch')
+
+            _ya = (_aplicado == _propuesta)
+            if _aplicado:
+                st.success(f"✅ Currently applied: {sc.describir_recorte(_aplicado)}.")
+            else:
+                st.info("No crop applied — the models use the full spectrum.")
+            _a1, _a2, _ = st.columns([1.6, 1.4, 3])
+            if _a1.button("✅ Apply crop", key="crop_btn_aplicar", type="secondary" if _ya else "primary",
+                          disabled=_ya or _mask_prev is None,
+                          help="Makes the cropped spectrum available in the model tabs and in Model "
+                               "screening. Models already trained are flagged as out of date only if "
+                               "they used the crop."):
+                st.session_state["crop_aplicado"] = _propuesta
+                st.session_state["crop_desc_aplicada"] = sc.describir_recorte(_propuesta)
+                st.rerun()
+            if _a2.button("↩ Reset (no crop)", key="crop_btn_reset", disabled=_aplicado is None):
+                st.session_state.pop("crop_aplicado", None)
+                st.session_state.pop("crop_desc_aplicada", None)
+                st.rerun()
+
+# -----------------------------------------------------------------------
+# TAB: MODEL SCREENING
+# -----------------------------------------------------------------------
+if _abierta(tabs[8]):
+    with tabs[8]:
+        st.subheader("Model screening")
+        if sc is None:
+            st.error("The module `screening_en.py` is missing. Upload it to the same folder as "
+                     "`app_en.py` to enable this tab.")
+        else:
+            st.caption(
+                "Try MANY combinations at once — spectrum (full / cropped) × preprocessing × variable "
+                "selection × algorithm — with deliberately cheap settings, and get a ranking on the "
+                "independent TEST set (AUC for classification, RMSE for regression, efficiency for SIMCA), "
+                "with every training (CV) and test metric alongside. Use it to decide where to look, then "
+                "refine the best candidates in the Classification / SIMCA / Regression tabs.")
+            st.info("Fair comparison: every combination uses the SAME train/test split, and variable "
+                    "selection (Boruta / genetic algorithm) is fitted on the training samples only — so "
+                    "the test ranking is not inflated by selection done with test samples.", icon="ℹ️")
+
+            _ids_s, _Xraw_s, _clases_s = datos_activos()
+            _Xact_s = st.session_state.X_pret[indice_activo()]
+            _valores_s = st.session_state.valores_y
+
+            _tarea = st.selectbox("What do you want to screen?", ["Classification", "Regression", "SIMCA"],
+                                  key="scr_w_tarea")
+            _datos_ok = True
+            if _tarea in ("Classification", "SIMCA"):
+                if _clases_s is None:
+                    st.warning("Define classes in the left-hand panel first.")
+                    _datos_ok = False
+                elif pd.Series(_clases_s).value_counts().min() < 4:
+                    st.error("Some class has fewer than 4 samples — too few to train, cross-validate and test.")
+                    _datos_ok = False
+            else:
+                if _valores_s is None:
+                    st.warning("Load the reference values (left-hand panel) to screen regression models.")
+                    _datos_ok = False
+
+            if _datos_ok:
+                _tipos = list(sc.RECETAS_POR_TIPO.keys())
+                _tipo_def = st.session_state.get("pret_w_tipo", "NIR / MIR")
+                _tipo_s = st.selectbox("Signal type", _tipos, index=_tipos.index(_tipo_def) if _tipo_def in _tipos else 0,
+                                       key="scr_w_tipo", help="Decides which preprocessing combinations are offered.")
+
+                # ---------------- spectrum
+                _crop_ok = sc.mascara_recorte(np.array(st.session_state.numeros_onda), st.session_state.get("crop_aplicado")) is not None
+                _opc_esp = ["Full spectrum"] + (["Cropped spectrum"] if _crop_ok else [])
+                _esp_sel = st.multiselect("Spectrum", _opc_esp, default=_opc_esp, key=f"scr_w_esp_{len(_opc_esp)}",
+                                          help="Cropped spectrum uses the regions defined in the Crop tab.")
+                if not _crop_ok:
+                    st.caption("To also screen a cropped spectrum, define and apply a crop in the ✂️ Crop tab first.")
+
+                # ---------------- preprocessing combinations
+                _recetas_cat = sc.RECETAS_POR_TIPO[_tipo_s]
+                _recetas_sel = []
+                with st.expander("☑️ Preprocessing combinations to test", expanded=True):
+                    st.caption("Each is computed from the raw spectra on the full axis (smoothing / derivatives "
+                               "with window 11, polynomial order 2).")
+                    for _i, (_nom, _a, _b) in enumerate(_recetas_cat):
+                        if st.checkbox(_nom, value=_i < sc.PREMARCADAS, key=f"scr_w_rec_{_tipo_s}_{_i}"):
+                            _recetas_sel.append((_nom, _a, _b))
+                    if st.checkbox(sc.RECETA_ACTUAL, value=False, key="scr_w_rec_actual",
+                                   help="Uses the preprocessing currently applied in the Preprocessing tab as one more candidate."):
+                        _recetas_sel.append(sc.RECETA_ACTUAL)
+
+                # ---------------- selection + algorithms
+                _sel_sel, _alg_sel, _var_sel = ["-"], ["SIMCA"], [0.95]
+                if _tarea != "SIMCA":
+                    _sel_sel = st.multiselect("Variable selection", ["None", "Boruta", "Genetic Algorithm"],
+                                              default=["None"], key="scr_w_sel",
+                                              help="Boruta / genetic algorithm are the slowest part of a screening.")
+                    _cat = mu.crear_clasificadores() if _tarea == "Classification" else mu.crear_regresores()
+                    _def_alg = ["LDA", "PLS-DA", "Random Forest", "SVM"] if _tarea == "Classification" \
+                        else ["PLS", "Ridge", "Random Forest"]
+                    _alg_sel = st.multiselect("Algorithms", list(_cat.keys()),
+                                              default=[a for a in _def_alg if a in _cat],
+                                              key=f"scr_w_alg_{_tarea}")
+                else:
+                    _var_sel = st.multiselect("Explained variance of each class model", [0.90, 0.95, 0.99],
+                                              default=[0.95], format_func=lambda v: f"{v:.0%}", key="scr_w_var")
+
+                with st.expander("⚙️ Screening settings (defaults are chosen for speed)"):
+                    _s1, _s2, _s3 = st.columns(3)
+                    _cv_s = _s1.slider("Cross-validation folds", 3, 10, 5, key="scr_w_cv",
+                                       help="Fewer folds = faster.") if _tarea != "SIMCA" else 5
+                    _prop_s = _s2.slider("Independent test set (%)", 15, 40, 25, key="scr_w_prop") / 100
+                    _opt_s = _s3.checkbox("Optimize hyperparameters (fastest preset)", value=True, key="scr_w_opt",
+                                          disabled=_tarea == "SIMCA",
+                                          help="Random search over 8 combinations — the quickest option. "
+                                               "Turn it off for an even faster, rougher screening.")
+                    _b1, _b2, _b3 = st.columns(3)
+                    _bor_s = _b1.number_input("Boruta iterations", 10, 500, 50, step=10, key="scr_w_bor")
+                    _gap_s = _b2.number_input("Genetic algorithm: population", 6, 60, 12, step=2, key="scr_w_gap")
+                    _gag_s = _b3.number_input("Genetic algorithm: generations", 3, 40, 6, step=1, key="scr_w_gag")
+
+                # ---------------- how big is this?
+                _n_rec, _n_esp = len(_recetas_sel), len(_esp_sel)
+                _total_s = sc.contar_combinaciones(_tarea, _n_rec, _n_esp, len(_sel_sel), len(_alg_sel), max(1, len(_var_sel)))
+                _n_sel_runs = _n_rec * _n_esp * (int("Boruta" in _sel_sel) + int("Genetic Algorithm" in _sel_sel))
+                st.markdown(f"**This will train {_total_s} model(s)**"
+                            + (f", including {_n_sel_runs} variable-selection run(s) (the slow part)." if _n_sel_runs else "."))
+                if _total_s > 150 or _n_sel_runs > 12:
+                    st.warning("That is a big screening and may take a long time (minutes to hours, depending on "
+                               "your data and the server). Consider ticking fewer preprocessing combinations, "
+                               "algorithms or selection methods. Results are kept as they come in, so an "
+                               "interrupted run can be resumed.")
+
+                # ---------------- run / resume / clear
+                _filas_s = st.session_state.get("scr_filas", [])
+                _estado_s = st.session_state.get("scr_estado")
+                _firma_s = (firma_datos_activos(), st.session_state.get("crop_desc_aplicada"), _tarea)
+                _r1, _r2, _r3, _ = st.columns([1.5, 1.2, 1, 3])
+                _iniciar = _r1.button("▶ Run screening" if not _filas_s else "🔁 Run again (replaces results)",
+                                      type="primary", key="scr_btn_run",
+                                      disabled=_total_s == 0 or not _alg_sel or not _esp_sel or not _sel_sel)
+                _reanudar = _r2.button("⏩ Resume", key="scr_btn_resume",
+                                       disabled=not (_estado_s and not _estado_s.get("completo")
+                                                     and _estado_s.get("tarea") == _tarea),
+                                       help="Continues an interrupted run, skipping what is already done.")
+                if _r3.button("🧹 Clear", key="scr_btn_clear", disabled=not _filas_s):
+                    st.session_state.pop("scr_filas", None)
+                    st.session_state.pop("scr_estado", None)
+                    st.rerun()
+
+                if _iniciar or _reanudar:
+                    if _iniciar:
+                        st.session_state["scr_filas"] = []
+                        _ya = set()
+                    else:
+                        _ya = {(f.get("Preprocessing"), f.get("Spectrum"), f.get("Variable selection"), f.get("Algorithm"))
+                               for f in st.session_state.get("scr_filas", []) if not isinstance(f.get("Error"), str)}
+                        st.session_state["scr_filas"] = [f for f in st.session_state.get("scr_filas", [])
+                                                         if not isinstance(f.get("Error"), str)]
+                    _mask_ok = np.ones(len(_Xraw_s), dtype=bool)
+                    if _tarea == "Regression":
+                        _y_s = np.asarray(_valores_s[indice_activo()], dtype=float)
+                        _mask_ok = ~np.isnan(_y_s)
+                    else:
+                        _y_s = np.asarray(_clases_s)
+                    _datos_s = {"X_raw": _Xraw_s[_mask_ok], "eje_raw": np.array(st.session_state.numeros_onda, dtype=float),
+                                "X_actual": _Xact_s[_mask_ok], "eje_actual": np.array(st.session_state.numeros_onda_pret, dtype=float),
+                                "ids": _ids_s[_mask_ok], "y": _y_s[_mask_ok],
+                                "crop": st.session_state.get("crop_aplicado")}
+                    _cfg_s = {"recetas": _recetas_sel,
+                              "espectros": ["Full" if e.startswith("Full") else "Cropped" for e in _esp_sel],
+                              "seleccion": _sel_sel, "algoritmos": _alg_sel, "varianzas": _var_sel,
+                              "cv": _cv_s, "prop_test": _prop_s, "optimizar": bool(_opt_s) and _tarea != "SIMCA",
+                              "boruta_iter": int(_bor_s), "ga_pob": int(_gap_s), "ga_gen": int(_gag_s)}
+                    st.session_state["scr_estado"] = {"tarea": _tarea, "tipo": _tipo_s, "total": _total_s,
+                                                      "completo": False, "firma": _firma_s,
+                                                      "fecha": _fecha_hora_informe()}
+                    _barra = st.progress(0.0, text="Starting...")
+                    _t_ini = time.time()
+
+                    def _progreso_scr(h, t, texto):
+                        _el = time.time() - _t_ini
+                        _eta = f" · ~{int(_el / h * (t - h))} s left" if h > 0 else ""
+                        _barra.progress(min(h / max(t, 1), 1.0), text=f"{h}/{t} — {texto} · {int(_el)} s elapsed{_eta}")
+
+                    sc.ejecutar(_tarea, _datos_s, _cfg_s, aplicar_paso,
+                                al_terminar_fila=lambda f: st.session_state["scr_filas"].append(f),
+                                progreso=_progreso_scr, ya_hechas=_ya)
+                    st.session_state["scr_estado"]["completo"] = True
+                    st.rerun()
+
+                # ---------------- results
+                if _filas_s:
+                    _df_rank = sc.tabla_ranking(_filas_s, _tarea)
+                    _principal = sc.CLAVE_RANKING[_tarea][0]
+                    if _estado_s and not _estado_s.get("completo"):
+                        st.warning(f"⏸ Incomplete run: {len(_filas_s)} of {_estado_s['total']} combinations finished "
+                                   "(the run was interrupted). The ranking below covers only those — click Resume.")
+                    if _estado_s and _estado_s.get("firma") != _firma_s and _estado_s.get("tarea") == _tarea:
+                        st.warning("⚠️ This ranking was computed with a data / preprocessing / outlier / crop state "
+                                   "that is different from the current one.")
+                    st.markdown(f"#### Ranking — {_estado_s['tarea'] if _estado_s else _tarea}")
+                    st.caption(f"Sorted by **{_principal}** "
+                               f"({'lower is better' if sc.CLAVE_RANKING[_tarea][1] else 'higher is better'}); ties are "
+                               "broken by the next test metric and then by the simpler model (fewer variables). "
+                               "All training (CV) and test metrics are shown.")
+                    _fmt = {c: "{:.3f}" for c in _df_rank.columns
+                            if c not in ("Rank", "n variables", "Time (s)") and pd.api.types.is_float_dtype(_df_rank[c])}
+                    st.dataframe(_df_rank.style.format(_fmt, na_rep="–"), width='stretch', height=min(620, 60 + 35 * len(_df_rank)))
+                    _d1, _d2, _ = st.columns([1.5, 1.5, 3])
+                    _d1.download_button("⬇️ Download ranking (Excel)", data=df_a_excel_bytes({"screening_ranking": _df_rank}),
+                                        file_name="model_screening_ranking.xlsx",
+                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                        key="scr_dl_xlsx")
+                    _d2.download_button("⬇️ Download ranking (CSV)", data=_df_rank.to_csv(index=False).encode("utf-8"),
+                                        file_name="model_screening_ranking.csv", mime="text/csv", key="scr_dl_csv")
+
+                    # ---- take a candidate to the other tabs
+                    st.markdown("#### Refine a candidate")
+                    _top = _df_rank[_df_rank.get("Error", pd.Series([np.nan] * len(_df_rank))).isna()].head(20)
+                    if len(_top):
+                        _rk = st.selectbox("Candidate (rank)", list(_top["Rank"]), key="scr_w_rank",
+                                           format_func=lambda r: f"#{r}  {_top[_top['Rank'] == r].iloc[0]['Preprocessing']} · "
+                                           f"{_top[_top['Rank'] == r].iloc[0]['Spectrum']} · "
+                                           f"{_top[_top['Rank'] == r].iloc[0]['Variable selection']} · "
+                                           f"{_top[_top['Rank'] == r].iloc[0]['Algorithm']}")
+                        _fila_top = _top[_top["Rank"] == _rk].iloc[0]
+                        _tipo_run = (_estado_s or {}).get("tipo", _tipo_s)
+                        _mapa_rec = {n: (a, b) for n, a, b in sc.RECETAS_POR_TIPO.get(_tipo_run, [])}
+                        _rec_n = _fila_top["Preprocessing"]
+                        _pasos_txt = (f"set Step A = **{_mapa_rec[_rec_n][0]}**, Step B = **{_mapa_rec[_rec_n][1]}** (A → B), then Apply"
+                                      if _rec_n in _mapa_rec else "keep the preprocessing you already have applied")
+                        st.markdown(
+                            f"To reproduce it: in **Preprocessing** {_pasos_txt}; in the model tab choose "
+                            f"**{'Cropped spectrum' if _fila_top['Spectrum'] == 'Cropped' else 'Full spectrum (no crop)'}**, "
+                            f"variable selection **{_fila_top['Variable selection']}** and algorithm **{_fila_top['Algorithm']}**.")
+                        if _rec_n in _mapa_rec and st.button("🧪 Set up the Preprocessing tab with this recipe", key="scr_btn_prep"):
+                            st.session_state["pret_w_tipo"] = _tipo_run
+                            st.session_state[f"pret_w_a_{_tipo_run}"] = _mapa_rec[_rec_n][0]
+                            st.session_state[f"pret_w_b_{_tipo_run}"] = _mapa_rec[_rec_n][1]
+                            st.session_state["pret_w_orden"] = "A → B (recommended)"
+                            st.success("Done — now open the 🧪 Preprocessing tab and click **Apply**.")
