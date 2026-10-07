@@ -3332,14 +3332,17 @@ if _abierta(tabs[10]):
                              "cumulative explained variance — capped at roughly a third of that class's "
                              "calibration samples, so the model doesn't run out of residual degrees of "
                              "freedom (which would make it fit calibration noise instead of real "
-                             "structure, and fail to generalize to new samples).",
+                             "structure, and fail to generalize to new samples). To DETECT MORE ADULTERATED "
+                             "samples use a higher value (0.95–0.99): a stricter model, but more false alarms.",
                     )
                     alpha_simca = st.slider("Significance level (alpha)", 0.01, 0.10, 0.05, step=0.01,
                                              key="alpha_simca",
                                              help="Controls how strict each class boundary is. Smaller "
                                                   "alpha (e.g. 0.01) = a wider, more permissive boundary; "
                                                   "larger alpha (e.g. 0.10) = a tighter one that rejects "
-                                                  "more borderline samples. 0.05 is the usual default.")
+                                                  "more borderline samples. 0.05 is the usual default. To DETECT MORE "
+                                                  "ADULTERATED samples raise it (0.10+): fewer adulterated samples "
+                                                  "slip through, but more genuine ones are rejected (false alarms).")
                 with col2:
                     prop_test_simca = st.slider(
                         "Proportion for independent test set (0 = validate on calibration only)",
@@ -3477,11 +3480,30 @@ if _abierta(tabs[10]):
                             "Components": modelo_c["n_comp"],
                             "Variance explained": f"{modelo_c['varianza_explicada_pct']:.1f}%",
                             "Calibration samples": modelo_c["n_muestras_calibracion"],
-                            "Sensitivity (true members accepted)": round(sensibilidad, 3) if pd.notna(sensibilidad) else "n/a",
-                            "Specificity (non-members rejected)": round(especificidad, 3) if pd.notna(especificidad) else "n/a",
+                            "Genuine samples accepted": round(sensibilidad, 3) if pd.notna(sensibilidad) else "n/a",
+                            "Adulterated / other-class detected": round(especificidad, 3) if pd.notna(especificidad) else "n/a",
+                            "False alarms (genuine rejected)": round(1 - sensibilidad, 3) if pd.notna(sensibilidad) else "n/a",
+                            "Missed (adulterated accepted)": round(1 - especificidad, 3) if pd.notna(especificidad) else "n/a",
                         })
                     df_simca_resumen = pd.DataFrame(filas_simca)
                     st.dataframe(df_simca_resumen, width='stretch')
+                    st.caption("Read per class, taking that class as the GENUINE product and everything else as "
+                               "adulterated / other: **Adulterated / other-class detected** is the detection rate "
+                               "(you want it high); **False alarms** are genuine samples wrongly rejected; "
+                               "**Missed** are adulterated samples wrongly accepted as genuine. "
+                               "(Genuine accepted = classical SIMCA sensitivity; adulterated detected = specificity.)")
+                    with st.expander("🎯 How to tune for detecting adulteration"):
+                        st.markdown(
+                            "- **To catch more adulterated samples (lower 'Missed')**: raise the significance level "
+                            "(alpha 0.10 or more) and/or raise the target variance (0.95–0.99). The class boundary "
+                            "gets tighter, so fewer foreign samples slip in — at the price of more false alarms.\n"
+                            "- **To reduce false alarms on genuine samples**: lower alpha (0.01–0.02) and/or lower the "
+                            "target variance (0.85–0.90). Missed adulterated samples will go up.\n"
+                            "- Beyond these two knobs, the preprocessing (e.g. SNV + derivative) and cropping the "
+                            "spectrum to the informative region usually matter more. Remove outliers from the "
+                            "genuine class first, or the boundary widens and lets adulterated samples through.\n"
+                            "- Always judge on an **independent test set** that includes adulterated samples, "
+                            "changing one knob at a time.")
                     st.download_button(
                         "⬇️ Download SIMCA summary (Excel)",
                         data=df_a_excel_bytes({"simca_summary": df_simca_resumen}),
@@ -3587,9 +3609,9 @@ if _abierta(tabs[10]):
                             "cv_desc": "n/a (class-modeling, not cross-validated the same way)",
                             "prop_test_desc": f"{int(st.session_state['simca_prop_test']*100)}% "
                                               f"({st.session_state['simca_metodo_split']})",
-                            "metricas": {f"Sensitivity ({row['Class']})": row["Sensitivity (true members accepted)"]
+                            "metricas": {f"Genuine samples accepted ({row['Class']})": row["Genuine samples accepted"]
                                          for row in filas_simca}
-                                        | {f"Specificity ({row['Class']})": row["Specificity (non-members rejected)"]
+                                        | {f"Adulterated / other-class detected ({row['Class']})": row["Adulterated / other-class detected"]
                                            for row in filas_simca},
                             "entorno_software": mu.info_entorno_software(),
                         }

@@ -548,9 +548,11 @@ def _b_simca(ss):
         sens = dentro[miembro].mean() if miembro.any() else np.nan
         espec = (~dentro[~miembro]).mean() if (~miembro).any() else np.nan
         filas.append([c, m["n_comp"], f"{m['varianza_explicada_pct']:.1f}%", m["n_muestras_calibracion"],
-                      f"{sens:.3f}" if pd.notna(sens) else "n/a", f"{espec:.3f}" if pd.notna(espec) else "n/a"])
+                      f"{sens:.3f}" if pd.notna(sens) else "n/a", f"{espec:.3f}" if pd.notna(espec) else "n/a",
+                      f"{1 - sens:.3f}" if pd.notna(sens) else "n/a", f"{1 - espec:.3f}" if pd.notna(espec) else "n/a"])
     b.append({"tipo": "tabla", "encabezados": ["Class", "Components", "Variance explained", "Calibration samples",
-                                               "Sensitivity (members accepted)", "Specificity (non-members rejected)"],
+                                               "Genuine accepted", "Adulterated / other detected",
+                                               "False alarms", "Missed"],
               "filas": filas})
     b.append({"tipo": "clave_valor", "pares": [
         ("Accepted by exactly 1 class", int((n_acc == 1).sum())),
