@@ -296,7 +296,7 @@ def crear_clasificadores(n_componentes_pls=5, random_state=0):
         "PLS-DA": PLSDAClassifier(n_components=n_componentes_pls),
         "Logistic Regression": LogisticRegression(max_iter=2000),
         "Naive Bayes": GaussianNB(),
-        "Random Forest": RandomForestClassifier(n_estimators=300, random_state=random_state, n_jobs=1),
+        "Random Forest": RandomForestClassifier(n_estimators=150, random_state=random_state, n_jobs=1),
         "SVM": SVC(kernel="rbf", probability=True, random_state=random_state),
         "Decision Tree": DecisionTreeClassifier(random_state=random_state),
         "XGBoost": XGBClassifierWrapper(
@@ -319,7 +319,7 @@ def crear_regresores(n_componentes_pls=5, random_state=0):
         "Lasso": Lasso(alpha=0.01, max_iter=20000),
         "Ridge": Ridge(alpha=1.0),
         "Elastic Net": ElasticNet(alpha=0.01, l1_ratio=0.5, max_iter=20000),
-        "Random Forest": RandomForestRegressor(n_estimators=200, max_features=0.2, random_state=random_state, n_jobs=1),
+        "Random Forest": RandomForestRegressor(n_estimators=100, max_features=0.2, random_state=random_state, n_jobs=1),
         "SVM (SVR)": SVR(kernel="rbf"),
         "Decision Tree": DecisionTreeRegressor(random_state=random_state),
         "XGBoost": XGBRegressor(n_estimators=200, colsample_bytree=0.3, max_bin=64, random_state=random_state, n_jobs=1),
@@ -905,17 +905,25 @@ def seleccionar_variables_boruta(X, y, es_clasificacion, random_state=0, max_ite
     """
     from boruta import BorutaPy
 
-    if es_clasificacion:
-        estimador = RandomForestClassifier(n_estimators=200, random_state=random_state, n_jobs=N_JOBS)
-    else:
-        estimador = RandomForestRegressor(n_estimators=200, random_state=random_state, n_jobs=N_JOBS)
+    # Boruta recommends shallow trees; "auto" n_estimators and full-depth trees on
+    # hundreds of spectral variables were the cause of multi-minute runs.
+    kw = dict(n_estimators=100, max_depth=7, max_features="sqrt",
+              random_state=random_state, n_jobs=N_JOBS)
+    estimador = RandomForestClassifier(**kw) if es_clasificacion else RandomForestRegressor(**kw)
 
     seleccionador = BorutaPy(
-        estimador, n_estimators="auto", random_state=random_state, max_iter=max_iter,
+        estimador, n_estimators=100, perc=90, random_state=random_state, max_iter=max_iter,
         alpha=alpha, verbose=0,
     )
     seleccionador.fit(np.asarray(X, dtype=float), np.asarray(y))
-    return seleccionador.support_
+    mascara = np.asarray(seleccionador.support_, dtype=bool)
+    if mascara.sum() < 2:
+        # With hundreds of correlated variables few get formally "confirmed" in a short
+        # run: fall back to confirmed + tentative ones instead of discarding the result.
+        mascara = mascara | np.asarray(seleccionador.support_weak_, dtype=bool)
+    if mascara.sum() < 2:
+        mascara = np.zeros_like(mascara)      # callers treat 'nothing selected' as 'use all variables'
+    return mascara
 
 
 # =============================================================================

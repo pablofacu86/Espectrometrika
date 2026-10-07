@@ -2065,10 +2065,45 @@ if _abierta(tabs[5]):
                 T2_lo, T2_hi = cu.rango_con_margen(T2, T2_lim)
                 Q_lo, Q_hi = cu.rango_con_margen(Q, Q_lim)
 
-                fig = px.scatter(x=T2, y=Q, hover_name=ids,
-                                  color=clases if clases is not None else None,
-                        color_discrete_sequence=CLASS_PALETTE,
-                                  labels={"x": "Hotelling's T²", "y": "Q residual"})
+                # ---- colouring: by class, or by a continuous value (colour gradient)
+                _col_vals_o, _col_lab_o = None, None
+                _vals_o = None
+                if st.session_state.get("valores_y") is not None:
+                    _mapa_o = dict(zip(map(str, st.session_state.ids), st.session_state.valores_y))
+                    _vals_o = np.array([_mapa_o.get(str(i), np.nan) for i in ids], dtype=float)
+                _opc_o = ["Class" if clases is not None else "None"]
+                if _vals_o is not None:
+                    _opc_o.append("Reference value (gradient)")
+                _eje_o = st.session_state.get("pca_eje")
+                _X_o = st.session_state.get("pca_X_input")
+                _spec_ok_o = _eje_o is not None and _X_o is not None and len(_X_o) == len(ids)
+                if _spec_ok_o:
+                    _opc_o.append("Spectral variable (gradient)")
+                _modo_o = st.radio("Color samples by", _opc_o, horizontal=True, key="out_w_color",
+                                   help="Paint each sample by its class, by its analyte concentration / reference "
+                                        "value (colour gradient), or by the signal at one wavelength / variable — "
+                                        "useful to see at a glance whether the outliers share a concentration or class.")
+                if _modo_o.startswith("Reference"):
+                    _col_vals_o, _col_lab_o = _vals_o, "Reference value"
+                elif _modo_o.startswith("Spectral"):
+                    _eje_oo = np.asarray(_eje_o, dtype=float)
+                    _v_o = st.select_slider("Variable (wavelength / wavenumber)",
+                                            options=[float(v) for v in _eje_oo],
+                                            value=float(_eje_oo[len(_eje_oo) // 2]), key="out_w_color_var",
+                                            format_func=lambda v: f"{v:g}")
+                    _jo = int(np.argmin(np.abs(_eje_oo - _v_o)))
+                    _col_vals_o, _col_lab_o = np.asarray(_X_o)[:, _jo], f"Signal @ {_eje_oo[_jo]:g}"
+
+                if _col_vals_o is not None:
+                    fig = px.scatter(x=T2, y=Q, hover_name=ids, color=_col_vals_o, color_continuous_scale="Viridis",
+                                     labels={"x": "Hotelling's T²", "y": "Q residual", "color": _col_lab_o})
+                    fig.update_traces(marker=dict(size=8, line=dict(width=0.5, color="rgba(60,60,60,.5)")))
+                    fig.update_layout(coloraxis_colorbar=dict(title=_col_lab_o))
+                else:
+                    fig = px.scatter(x=T2, y=Q, hover_name=ids,
+                                     color=clases if clases is not None else None,
+                                     color_discrete_sequence=CLASS_PALETTE,
+                                     labels={"x": "Hotelling's T²", "y": "Q residual"})
                 _ids_ya_excl = set(map(str, st.session_state.ids[st.session_state.mascara_excluidas]))
                 _m_ya = np.array([str(i) in _ids_ya_excl for i in ids])
                 if _m_ya.any():
