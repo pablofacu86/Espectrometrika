@@ -353,25 +353,92 @@ def df_a_excel_bytes(hojas):
 # those only actually recompute when their real inputs change.
 # =============================================================================
 
-@st.cache_data(show_spinner=False)
+def _separador_csv(bytes_archivo):
+    """Guess the CSV delimiter (comma, semicolon or tab) from the first line, and whether
+    the numbers use a decimal comma (typical of semicolon-separated files from Excel in
+    Spanish/other locales)."""
+    texto = bytes_archivo[:20000].decode("utf-8-sig", errors="ignore")
+    lineas = [l for l in texto.splitlines() if l.strip()][:15]
+    primera = lineas[0] if lineas else ""
+    sep = max([",", ";", "\t"], key=lambda c: primera.count(c)) if primera else ","
+    if primera.count(sep) == 0:
+        sep = ","
+    coma_decimal = sep != "," and any(re.search(r"\d,\d", l) for l in lineas[1:])
+    n_campos = max((l.count(sep) for l in bytes_archivo[:200000].decode("utf-8-sig", errors="ignore")
+                    .splitlines()[:15]), default=0) + 1
+    return sep, coma_decimal, n_campos
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def _leer_crudo_cacheado(bytes_archivo, nombre_archivo):
+    """Parses the file ONCE (no header assumed) and returns (sheet_names, {sheet: raw DataFrame},
+    decimal_comma). Everything else (sheet list, raw preview, header row) is derived from this
+    in memory, so changing the header row or a column choice never re-reads the file.
+    Excel files use the much faster 'calamine' engine when it is installed."""
+    if nombre_archivo.lower().endswith(".csv"):
+        sep, coma_decimal, n_campos = _separador_csv(bytes_archivo)
+        try:
+            df = pd.read_csv(io.BytesIO(bytes_archivo), header=None, sep=sep, low_memory=False,
+                             names=range(n_campos), encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            df = pd.read_csv(io.BytesIO(bytes_archivo), header=None, sep=sep, low_memory=False,
+                             names=range(n_campos), encoding="latin-1")
+        return ["(csv)"], {"(csv)": df}, coma_decimal
+    buffer = io.BytesIO(bytes_archivo)
+    try:
+        hojas = pd.read_excel(buffer, header=None, sheet_name=None, engine="calamine")
+    except Exception:
+        buffer.seek(0)
+        hojas = pd.read_excel(buffer, header=None, sheet_name=None)
+    return list(hojas.keys()), hojas, False
+
+
+def _aplicar_encabezado(raw, fila_encabezado, coma_decimal):
+    """Turns a raw (header=None) table into a normal one using the chosen header row."""
+    cabecera = raw.iloc[fila_encabezado - 1].tolist()
+    datos = raw.iloc[fila_encabezado:].reset_index(drop=True)
+    etiquetas, vistos = [], {}
+    for i, h in enumerate(cabecera):
+        if h is None or (isinstance(h, float) and np.isnan(h)):
+            h = f"Unnamed: {i}"
+        elif isinstance(h, float) and h.is_integer():
+            h = int(h)
+        h = str(h)
+        if h in vistos:
+            vistos[h] += 1
+            h = f"{h}.{vistos[h]}"
+        else:
+            vistos[h] = 0
+        etiquetas.append(h)
+    columnas = {}
+    for j, etq in enumerate(etiquetas):
+        col = datos.iloc[:, j]
+        if not pd.api.types.is_numeric_dtype(col):
+            conv = pd.to_numeric(col, errors="coerce")
+            if conv.notna().sum() == col.notna().sum():
+                col = conv
+            elif coma_decimal:
+                conv = pd.to_numeric(col.astype(str).str.replace(",", ".", regex=False), errors="coerce")
+                if conv.notna().sum() == col.notna().sum():
+                    col = conv
+        columnas[etq] = col.reset_index(drop=True)
+    return pd.DataFrame(columnas)
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
 def _leer_archivo_cacheado(bytes_archivo, nombre_archivo, hoja, fila_encabezado):
-    """Cached raw file read + header-row parsing, keyed by the file's own
-    bytes (not just its name) — so re-parsing only happens when the file, the
-    chosen sheet, or the header row actually change, not on every rerun."""
-    buffer = io.BytesIO(bytes_archivo)
-    if nombre_archivo.lower().endswith(".csv"):
-        return pd.read_csv(buffer, header=fila_encabezado - 1)
-    return pd.read_excel(buffer, header=fila_encabezado - 1, sheet_name=hoja)
+    """Header-applied table, derived from the single cached parse of the file."""
+    _, hojas, coma_decimal = _leer_crudo_cacheado(bytes_archivo, nombre_archivo)
+    raw = hojas[hoja] if hoja in hojas else next(iter(hojas.values()))
+    return _aplicar_encabezado(raw, fila_encabezado, coma_decimal)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=4)
 def _leer_preview_cacheada(bytes_archivo, nombre_archivo, hoja):
-    """Cached raw preview (first rows, no header assumed) for the
-    'raw preview' expander."""
-    buffer = io.BytesIO(bytes_archivo)
-    if nombre_archivo.lower().endswith(".csv"):
-        return pd.read_csv(buffer, header=None, nrows=6)
-    return pd.read_excel(buffer, header=None, nrows=6, sheet_name=hoja)
+    """First rows of the raw table (no header assumed), for the 'raw preview' expander."""
+    _, hojas, _ = _leer_crudo_cacheado(bytes_archivo, nombre_archivo)
+    raw = hojas[hoja] if hoja in hojas else next(iter(hojas.values()))
+    return raw.head(6).astype(str)
 
 
 @st.cache_data(show_spinner=False)
@@ -903,7 +970,7 @@ with st.sidebar:
 
             hoja_elegida = None
             if es_excel:
-                nombres_hojas = pd.ExcelFile(io.BytesIO(bytes_archivo)).sheet_names
+                nombres_hojas = _leer_crudo_cacheado(bytes_archivo, archivo.name)[0]
                 if len(nombres_hojas) > 1:
                     hoja_elegida = st.selectbox(
                         "Sheet", nombres_hojas, key=f"hoja_{id_archivo}",
@@ -934,9 +1001,12 @@ with st.sidebar:
 
             col1, col2 = st.columns(2)
             with col1:
+                _id_por_defecto = 1 if (len(df_completo.columns) > 0 and
+                                        not pd.api.types.is_numeric_dtype(df_completo.iloc[:, 0])) else 0
                 opcion_id = st.selectbox(
                     "Sample ID column",
                     ["(none — auto-generate)"] + columnas,
+                    index=_id_por_defecto,
                     key=f"opcion_id_{id_archivo}",
                     help="Which column holds each sample's unique name/ID. Pick 'none' to auto-generate "
                          "Sample_1, Sample_2... if your file doesn't have one.",
@@ -1053,7 +1123,10 @@ with st.sidebar:
                 st.caption("ℹ️ New file detected — previous Classification/Regression/SIMCA results "
                            "were cleared. Saved models (for the Predict tab) were kept.")
         except Exception as e:
-            st.error(f"Could not read '{archivo.name}' with that configuration: {e}")
+            st.error(f"Could not read '{archivo.name}' with that configuration: {e}  \n"
+                     "Tip: every column that is not a spectral variable (sample ID, class, "
+                     "reference value such as concentration) must be assigned in the three "
+                     "selectors above; all the remaining columns are read as spectra.")
             if st.session_state.get("archivo_cargado_nombre") not in (None, archivo.name):
                 st.warning(f"⚠️ Still showing the previous file "
                            f"('{st.session_state['archivo_cargado_nombre']}') because this one could not be read. "
@@ -1320,7 +1393,10 @@ if not hay_datos():
 # TAB: DATA
 # -----------------------------------------------------------------------
 if _abierta(tabs[1]):
-    with tabs[1]:
+    # Each tab re-runs ON ITS OWN when one of its widgets changes (fragment), instead of
+    # re-executing the whole app. Buttons that must refresh other parts call st.rerun().
+    @st.fragment
+    def _frag_tab_1():
         st.subheader("Data preview")
         st.dataframe(st.session_state.df.head(10), width='stretch')
 
@@ -1334,28 +1410,37 @@ if _abierta(tabs[1]):
             clases_unicas = np.unique(clases)
             colores_clase = {c: paleta[i % len(paleta)] for i, c in enumerate(clases_unicas)}
 
-        for i in range(X.shape[0]):
-            color = colores_clase[clases[i]] if colores_clase is not None else "steelblue"
-            fig.add_trace(go.Scatter(
-                x=st.session_state.numeros_onda, y=X[i], mode="lines",
-                line=dict(width=1, color=color), opacity=0.6,
-                name=str(clases[i]) if clases is not None else str(ids[i]),
-                legendgroup=str(clases[i]) if clases is not None else None,
-                showlegend=bool(clases is not None and clases[i] not in [t.name for t in fig.data]),
-                hovertext=str(ids[i]),
-            ))
+        _grupos = np.unique(clases) if clases is not None else np.array(["all"])
+        for _g in _grupos:
+            _m = (clases == _g) if clases is not None else np.ones(X.shape[0], dtype=bool)
+            _Xg, _idg = X[_m], ids[_m]
+            _nv = _Xg.shape[1]
+            _xs = np.tile(np.append(np.asarray(st.session_state.numeros_onda, dtype=float), np.nan), _Xg.shape[0])
+            _ys = np.hstack([_Xg, np.full((_Xg.shape[0], 1), np.nan)]).ravel()
+            _hv = np.repeat(_idg.astype(str), _nv + 1)
+            fig.add_trace(go.Scattergl(
+                x=_xs, y=_ys, mode="lines", connectgaps=False,
+                line=dict(width=1, color=colores_clase[_g] if colores_clase is not None else "steelblue"),
+                opacity=0.6, name=str(_g) if clases is not None else "samples",
+                showlegend=clases is not None, hovertext=_hv, hoverinfo="text+x+y"))
         fig.update_layout(height=450, xaxis_title="Wavenumber / wavelength", yaxis_title="Signal")
         if st.session_state.numeros_onda[0] > st.session_state.numeros_onda[-1]:
             fig.update_xaxes(autorange="reversed")
         st.plotly_chart(fig, width='stretch')
         st.caption(f"Showing {X.shape[0]} of {st.session_state.X.shape[0]} samples "
                    f"({int(st.session_state.mascara_excluidas.sum())} excluded as outliers).")
+    with tabs[1]:
+        _frag_tab_1()
+
 
 # -----------------------------------------------------------------------
 # TAB: PREPROCESSING
 # -----------------------------------------------------------------------
 if _abierta(tabs[2]):
-    with tabs[2]:
+    # Each tab re-runs ON ITS OWN when one of its widgets changes (fragment), instead of
+    # re-executing the whole app. Buttons that must refresh other parts call st.rerun().
+    @st.fragment
+    def _frag_tab_2():
         st.subheader("Spectral preprocessing")
 
         # Important: preprocessing is always computed on ALL samples (not just the
@@ -1611,12 +1696,18 @@ if _abierta(tabs[2]):
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key="pret_dl_xlsx",
             )
+    with tabs[2]:
+        _frag_tab_2()
+
 
 # -----------------------------------------------------------------------
 # TAB: PCA
 # -----------------------------------------------------------------------
 if _abierta(tabs[4]):
-    with tabs[4]:
+    # Each tab re-runs ON ITS OWN when one of its widgets changes (fragment), instead of
+    # re-executing the whole app. Buttons that must refresh other parts call st.rerun().
+    @st.fragment
+    def _frag_tab_4():
         st.subheader("Principal Component Analysis (PCA)")
 
         ids_actuales, _, clases_actuales = datos_activos()
@@ -1708,16 +1799,50 @@ if _abierta(tabs[4]):
                 st.session_state.scores = scores
                 st.session_state.cargas = cargas
 
+                # ---- colouring: by class, or by a continuous value (colour gradient)
+                _color_vals, _color_lab = None, None
+                _valores_pca = None
+                if st.session_state.get("valores_y") is not None:
+                    _mapa_y = dict(zip(map(str, st.session_state.ids), st.session_state.valores_y))
+                    _valores_pca = np.array([_mapa_y.get(str(i), np.nan) for i in ids], dtype=float)
+                _opc_color = ["Class" if clases is not None else "None"]
+                if _valores_pca is not None:
+                    _opc_color.append("Reference value (gradient)")
+                _opc_color.append("Spectral variable (gradient)")
+                _modo_color = st.radio("Color samples by", _opc_color, horizontal=True, key="pca_w_color",
+                                       help="'Reference value' paints each sample on a colour scale according to its "
+                                            "analyte concentration / reference value. 'Spectral variable' uses the "
+                                            "(preprocessed) signal at one wavelength / variable instead.")
+                if _modo_color.startswith("Reference"):
+                    _color_vals, _color_lab = _valores_pca, "Reference value"
+                    if np.isnan(_valores_pca).any():
+                        st.caption(f"{int(np.isnan(_valores_pca).sum())} sample(s) have no reference value and are drawn in grey.")
+                elif _modo_color.startswith("Spectral"):
+                    _eje_col = np.asarray(st.session_state.pca_eje, dtype=float)
+                    _X_col = st.session_state.pca_X_input
+                    _v_txt = st.select_slider("Variable (wavelength / wavenumber)",
+                                              options=[float(v) for v in _eje_col],
+                                              value=float(_eje_col[len(_eje_col) // 2]), key="pca_w_color_var",
+                                              format_func=lambda v: f"{v:g}")
+                    _j = int(np.argmin(np.abs(_eje_col - _v_txt)))
+                    _color_vals, _color_lab = _X_col[:, _j], f"Signal @ {_eje_col[_j]:g}"
+
                 def grafico_scores(pc_x, pc_y):
+                    _kw = dict(color=clases if clases is not None else None,
+                               color_discrete_sequence=CLASS_PALETTE)
+                    if _color_vals is not None:
+                        _kw = dict(color=_color_vals, color_continuous_scale="Viridis")
                     fig = px.scatter(
                         x=scores_completo[:, pc_x - 1], y=scores_completo[:, pc_y - 1],
-                        color=clases if clases is not None else None,
-                        color_discrete_sequence=CLASS_PALETTE,
                         hover_name=ids,
                         labels={"x": f"PC{pc_x} ({var_explicada[pc_x-1]:.1f}%)",
-                                "y": f"PC{pc_y} ({var_explicada[pc_y-1]:.1f}%)"},
-                        title=f"Scores: PC{pc_x} vs PC{pc_y}",
+                                "y": f"PC{pc_y} ({var_explicada[pc_y-1]:.1f}%)",
+                                "color": _color_lab or "Class"},
+                        title=f"Scores: PC{pc_x} vs PC{pc_y}", **_kw,
                     )
+                    if _color_vals is not None:
+                        fig.update_traces(marker=dict(size=8, line=dict(width=0.5, color="rgba(60,60,60,.5)")))
+                        fig.update_layout(coloraxis_colorbar=dict(title=_color_lab))
                     fig.add_hline(y=0, line_color="lightgray")
                     fig.add_vline(x=0, line_color="lightgray")
                     fig.update_layout(height=420)
@@ -1756,21 +1881,57 @@ if _abierta(tabs[4]):
                         col_z: scores_completo[:, pcz_3d - 1],
                     })
                     df3d["ID"] = ids
-                    df3d["Class"] = clases if clases is not None else "All samples"
-                    fig3d = px.scatter_3d(df3d, x=col_x, y=col_y, z=col_z, color="Class", hover_name="ID",
-                                           color_discrete_sequence=CLASS_PALETTE)
+                    if _color_vals is not None:
+                        df3d[_color_lab] = _color_vals
+                        fig3d = px.scatter_3d(df3d, x=col_x, y=col_y, z=col_z, color=_color_lab, hover_name="ID",
+                                               color_continuous_scale="Viridis")
+                    else:
+                        df3d["Class"] = clases if clases is not None else "All samples"
+                        fig3d = px.scatter_3d(df3d, x=col_x, y=col_y, z=col_z, color="Class", hover_name="ID",
+                                               color_discrete_sequence=CLASS_PALETTE)
                     fig3d.update_traces(marker=dict(size=5))
                     fig3d.update_layout(height=550)
                     st.plotly_chart(fig3d, width='stretch')
                 else:
                     st.caption("At least 3 components are needed for the 3D plot.")
+    with tabs[4]:
+        _frag_tab_4()
+
 
 # -----------------------------------------------------------------------
 # TAB: OUTLIERS
 # -----------------------------------------------------------------------
 if _abierta(tabs[5]):
-    with tabs[5]:
+    # Each tab re-runs ON ITS OWN when one of its widgets changes (fragment), instead of
+    # re-executing the whole app. Buttons that must refresh other parts call st.rerun().
+    @st.fragment
+    def _frag_tab_5():
         st.subheader("Outlier detection: Hotelling's T² and Q residual")
+
+        _msg_toast = st.session_state.pop("_toast_exclusion", None)
+        if _msg_toast:
+            st.toast(_msg_toast, icon="🚫")
+        _mask_excl = st.session_state.get("mascara_excluidas")
+        if _mask_excl is not None and _mask_excl.any():
+            _ids_excl = st.session_state.ids[_mask_excl]
+            _n_ex = int(_mask_excl.sum())
+            _pf, _of = st.session_state.get("pca_firma"), st.session_state.get("outliers_firma")
+            _pca_al_dia = _pf is not None and len(_pf) > 3 and _pf[3] == _n_ex
+            _out_al_dia = _of is not None and len(_of) > 3 and _of[3] == _n_ex
+            _lista = ", ".join(map(str, _ids_excl[:15])) + (" …" if len(_ids_excl) > 15 else "")
+            if st.session_state.get("pca_completo") is None or (_pca_al_dia and _out_al_dia):
+                st.info(f"🚫 **{_n_ex} sample(s) excluded** from all analyses: {_lista}. "
+                        "The results shown below were computed without them.")
+            elif not _pca_al_dia:
+                st.warning(f"🚫 **{_n_ex} sample(s) excluded** from all analyses: {_lista}. "
+                           "The PCA and outlier plots below were computed **before** this change — click "
+                           "**Update PCA** (PCA tab), then **Update outliers** here.", icon="⚠️")
+            else:
+                st.warning(f"🚫 **{_n_ex} sample(s) excluded** from all analyses: {_lista}. "
+                           "PCA is already updated; click **Update outliers** below to recompute without them.",
+                           icon="⚠️")
+        else:
+            st.caption("No samples are excluded right now: all samples are used in every analysis.")
 
         if st.session_state.get("pca_completo") is None:
             st.info("Compute PCA first, in the **PCA** tab (needs at least 2 components).")
@@ -1804,8 +1965,8 @@ if _abierta(tabs[5]):
             )
             if _resultado_outliers_previo is not None:
                 if esta_desactualizado_out:
-                    st.warning("⚠️ **This outlier result is out of date** — PCA, preprocessing, alpha, or "
-                               "n_comp changed since it was last computed. The plot below still shows the "
+                    st.warning("⚠️ **This outlier result is out of date** — PCA, preprocessing, excluded "
+                               "samples, alpha, or n_comp changed since it was last computed. The plot below still shows the "
                                "last computed result. Click **Update** to recompute it.", icon="⚠️")
                 else:
                     st.caption("✅ Up to date with the current PCA result, preprocessing, and settings.")
@@ -1856,6 +2017,13 @@ if _abierta(tabs[5]):
                                   color=clases if clases is not None else None,
                         color_discrete_sequence=CLASS_PALETTE,
                                   labels={"x": "Hotelling's T²", "y": "Q residual"})
+                _ids_ya_excl = set(map(str, st.session_state.ids[st.session_state.mascara_excluidas]))
+                _m_ya = np.array([str(i) in _ids_ya_excl for i in ids])
+                if _m_ya.any():
+                    fig.add_trace(go.Scatter(
+                        x=T2[_m_ya], y=Q[_m_ya], mode="markers", name="already excluded",
+                        hovertext=[str(i) for i in ids[_m_ya]],
+                        marker=dict(symbol="x", size=12, color="black", line=dict(width=2))))
                 fig.add_shape(type="rect", x0=T2_lo, x1=T2_lim, y0=Q_lo, y1=Q_lim,
                               fillcolor="green", opacity=0.08, line_width=0, layer="below")
                 fig.add_shape(type="rect", x0=T2_lim, x1=T2_hi, y0=Q_lo, y1=Q_lim,
@@ -1889,9 +2057,15 @@ if _abierta(tabs[5]):
                 else:
                     es_outlier = Q > Q_lim
 
-                candidatos = ids[es_outlier]
-                st.markdown(f"**Outlier candidates with this criterion ({len(candidatos)}):** "
-                            + (", ".join(candidatos) if len(candidatos) else "none"))
+                _ids_ya_excl = set(map(str, st.session_state.ids[st.session_state.mascara_excluidas]))
+                _ya = np.array([str(i) in _ids_ya_excl for i in ids])
+                candidatos = ids[es_outlier & ~_ya]          # new ones, not yet excluded
+                candidatos_ya = ids[es_outlier & _ya]        # flagged but already excluded
+                st.markdown(f"**New outlier candidates with this criterion ({len(candidatos)}):** "
+                            + (", ".join(map(str, candidatos)) if len(candidatos) else "none"))
+                if len(candidatos_ya):
+                    st.caption(f"Already excluded and still flagged in this (older) result: "
+                               f"{', '.join(map(str, candidatos_ya))}. They are drawn as ✖ in the plot.")
 
                 if clases is not None and len(candidatos) > 0:
                     conteo_candidatos_por_clase = pd.Series(clases[es_outlier]).value_counts()
@@ -1907,15 +2081,20 @@ if _abierta(tabs[5]):
                                 "builds a separate model per class, so a class won't be penalized just for "
                                 "being different from the others.")
 
+                st.caption("Nothing is removed until you click **Exclude**. Excluded samples are kept in your "
+                           "file and can be brought back with **Restore**.")
                 col_a, col_b = st.columns(2)
-                if col_a.button("🚫 Exclude these samples from the analysis", disabled=(len(candidatos) == 0)):
+                if col_a.button(f"🚫 Exclude {len(candidatos)} new candidate(s) from the analysis",
+                                disabled=(len(candidatos) == 0)):
                     idx_global = np.array([np.where(st.session_state.ids == i)[0][0] for i in candidatos])
                     st.session_state.mascara_excluidas[idx_global] = True
-                    st.success(f"{len(candidatos)} sample(s) excluded. Other tabs no longer include them.")
+                    st.session_state["_toast_exclusion"] = (
+                        f"{len(candidatos)} sample(s) excluded. Update PCA and outliers to recompute.")
                     st.rerun()
-                if col_b.button("♻️ Restore all samples (undo exclusions)"):
+                if col_b.button("♻️ Restore all samples (undo exclusions)",
+                                disabled=not st.session_state.mascara_excluidas.any()):
                     st.session_state.mascara_excluidas[:] = False
-                    st.success("All samples restored.")
+                    st.session_state["_toast_exclusion"] = "All samples restored. Update PCA and outliers to recompute."
                     st.rerun()
 
                 st.divider()
@@ -1975,12 +2154,18 @@ if _abierta(tabs[5]):
                         file_name="exploratory_analysis_report.pdf", mime="application/pdf",
                         key="descargar_reporte_exp",
                     )
+    with tabs[5]:
+        _frag_tab_5()
+
 
 # -----------------------------------------------------------------------
 # TAB: DENDROGRAM
 # -----------------------------------------------------------------------
 if _abierta(tabs[6]):
-    with tabs[6]:
+    # Each tab re-runs ON ITS OWN when one of its widgets changes (fragment), instead of
+    # re-executing the whole app. Buttons that must refresh other parts call st.rerun().
+    @st.fragment
+    def _frag_tab_6():
         st.subheader("Hierarchical Cluster Analysis (HCA)")
 
         X_hca_vivo = st.session_state.X_pret[indice_activo()]
@@ -2081,12 +2266,18 @@ if _abierta(tabs[6]):
                             plt.close(fig_mpl)
                         res["figuras"]["circular"] = _buf.getvalue()
                     st.image(res["figuras"]["circular"])
+    with tabs[6]:
+        _frag_tab_6()
+
 
 # -----------------------------------------------------------------------
 # TAB: OTHER TOOLS
 # -----------------------------------------------------------------------
 if _abierta(tabs[7]):
-    with tabs[7]:
+    # Each tab re-runs ON ITS OWN when one of its widgets changes (fragment), instead of
+    # re-executing the whole app. Buttons that must refresh other parts call st.rerun().
+    @st.fragment
+    def _frag_tab_7():
         st.subheader("Other exploratory analysis tools")
         st.caption("Pick a tool, adjust its settings, and click **Compute**. Nothing runs until you do, "
                    "and each tool keeps its own result until you clear it.")
@@ -2386,12 +2577,18 @@ if _abierta(tabs[7]):
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key="descargar_mcr_excel",
                 )
+    with tabs[7]:
+        _frag_tab_7()
+
 
 # -----------------------------------------------------------------------
 # TAB: CLASSIFICATION
 # -----------------------------------------------------------------------
 if _abierta(tabs[9]):
-    with tabs[9]:
+    # Each tab re-runs ON ITS OWN when one of its widgets changes (fragment), instead of
+    # re-executing the whole app. Buttons that must refresh other parts call st.rerun().
+    @st.fragment
+    def _frag_tab_9():
         st.subheader("Supervised classification")
         if st.button("🔄 Reset this tab", key="reset_clf",
                      help="Clears all trained models, metrics, and plots from this tab, so you can "
@@ -3000,11 +3197,17 @@ if _abierta(tabs[9]):
                                 data=bytes(pdf_ficha.output()),
                                 file_name=f"model_card_{nombre_guardado}.pdf", mime="application/pdf",
                             )
+    with tabs[9]:
+        _frag_tab_9()
+
 
 # TAB: SIMCA
 # -----------------------------------------------------------------------
 if _abierta(tabs[10]):
-    with tabs[10]:
+    # Each tab re-runs ON ITS OWN when one of its widgets changes (fragment), instead of
+    # re-executing the whole app. Buttons that must refresh other parts call st.rerun().
+    @st.fragment
+    def _frag_tab_10():
         st.subheader("SIMCA — Soft Independent Modeling of Class Analogies")
         if st.button("🔄 Reset this tab", key="reset_simca",
                      help="Clears all trained SIMCA models and results from this tab, so you can start "
@@ -3311,11 +3514,17 @@ if _abierta(tabs[10]):
                         }
                         st.success(f"SIMCA model set '{nombre_guardado_simca}' saved (traceability ID: "
                                    f"{id_trazabilidad_simca}). It is now available in the Prediction tab.")
+    with tabs[10]:
+        _frag_tab_10()
+
 
 # TAB: REGRESSION
 # -----------------------------------------------------------------------
 if _abierta(tabs[11]):
-    with tabs[11]:
+    # Each tab re-runs ON ITS OWN when one of its widgets changes (fragment), instead of
+    # re-executing the whole app. Buttons that must refresh other parts call st.rerun().
+    @st.fragment
+    def _frag_tab_11():
         st.subheader("Supervised regression")
         if st.button("🔄 Reset this tab", key="reset_reg",
                      help="Clears all trained models, metrics, and plots from this tab, so you can "
@@ -4018,11 +4227,17 @@ if _abierta(tabs[11]):
                                 file_name=f"model_card_{nombre_guardado_r}.pdf", mime="application/pdf",
                                 key="descargar_ficha_reg",
                             )
+    with tabs[11]:
+        _frag_tab_11()
+
 
 # TAB: PREDICTION ON NEW SAMPLES
 # -----------------------------------------------------------------------
 if _abierta(tabs[12]):
-    with tabs[12]:
+    # Each tab re-runs ON ITS OWN when one of its widgets changes (fragment), instead of
+    # re-executing the whole app. Buttons that must refresh other parts call st.rerun().
+    @st.fragment
+    def _frag_tab_12():
         st.subheader("Prediction on new samples")
 
         with st.expander("💾 Save/load models on your PC (to use them another day)"):
@@ -4277,12 +4492,18 @@ if _abierta(tabs[12]):
             if st.button("🗑️ Delete all saved models"):
                 st.session_state.modelos_guardados = {}
                 st.rerun()
+    with tabs[12]:
+        _frag_tab_12()
+
 
 # -----------------------------------------------------------------------
 # TAB: FINAL REPORT
 # -----------------------------------------------------------------------
 if _abierta(tabs[13]):
-    with tabs[13]:
+    # Each tab re-runs ON ITS OWN when one of its widgets changes (fragment), instead of
+    # re-executing the whole app. Buttons that must refresh other parts call st.rerun().
+    @st.fragment
+    def _frag_tab_13():
         st.subheader("Final report")
         if inf is None:
             st.error("The report module `informe_final_en.py` is missing. Upload it to the same "
@@ -4385,12 +4606,18 @@ if _abierta(tabs[13]):
                               help="Removes the built report from memory."):
                     st.session_state.pop("informe_final", None)
                     st.rerun()
+    with tabs[13]:
+        _frag_tab_13()
+
 
 # -----------------------------------------------------------------------
 # TAB: CROP
 # -----------------------------------------------------------------------
 if _abierta(tabs[3]):
-    with tabs[3]:
+    # Each tab re-runs ON ITS OWN when one of its widgets changes (fragment), instead of
+    # re-executing the whole app. Buttons that must refresh other parts call st.rerun().
+    @st.fragment
+    def _frag_tab_3():
         st.subheader("Crop spectral regions")
         if sc is None:
             st.error("The module `screening_en.py` is missing. Upload it to the same folder as "
@@ -4535,12 +4762,18 @@ if _abierta(tabs[3]):
                 st.session_state.pop("crop_aplicado", None)
                 st.session_state.pop("crop_desc_aplicada", None)
                 st.rerun()
+    with tabs[3]:
+        _frag_tab_3()
+
 
 # -----------------------------------------------------------------------
 # TAB: MODEL SCREENING
 # -----------------------------------------------------------------------
 if _abierta(tabs[8]):
-    with tabs[8]:
+    # Each tab re-runs ON ITS OWN when one of its widgets changes (fragment), instead of
+    # re-executing the whole app. Buttons that must refresh other parts call st.rerun().
+    @st.fragment
+    def _frag_tab_8():
         st.subheader("Model screening")
         if sc is None:
             st.error("The module `screening_en.py` is missing. Upload it to the same folder as "
@@ -4833,3 +5066,6 @@ if _abierta(tabs[8]):
                             st.session_state[f"pret_w_b_{_tipo_run}"] = _mapa_rec[_rec_n][1]
                             st.session_state["pret_w_orden"] = "A → B (recommended)"
                             st.success("Done — now open the 🧪 Preprocessing tab and click **Apply**.")
+    with tabs[8]:
+        _frag_tab_8()
+
