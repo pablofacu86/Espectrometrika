@@ -80,7 +80,7 @@ class ReportePDF(FPDF):
         self.set_y(-12)
         self.set_font("Helvetica", "I", 8)
         self.set_text_color(150, 150, 150)
-        izquierda = "Espectrometrika"
+        izquierda = "Espectrometrika  |  All rights reserved"
         if self.fecha_hora:
             izquierda += f"  |  Report generated {self.fecha_hora}"
         self.cell(0, 10, _sanear(izquierda), align="L")

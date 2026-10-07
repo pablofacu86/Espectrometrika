@@ -51,6 +51,24 @@ st.set_page_config(
     layout="wide",
 )
 
+# Copyright footer (fixed at the bottom of every page, also on the Home screen)
+COPYRIGHT_TEXTO = "Espectrometrika · All rights reserved"
+st.markdown(f"""
+<style>
+.block-container {{ padding-bottom: 3.5rem; }}
+.app-footer {{
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 90;
+    text-align: center; font-size: 12px; color: #6B7785;
+    padding: 6px 10px; border-top: 1px solid rgba(128,128,128,.25);
+    background: rgba(255,255,255,.88); backdrop-filter: blur(4px);
+}}
+@media (prefers-color-scheme: dark) {{
+    .app-footer {{ background: rgba(14,17,23,.88); color: #9AA5B1; }}
+}}
+</style>
+<div class="app-footer">{COPYRIGHT_TEXTO}</div>
+""", unsafe_allow_html=True)
+
 # Brand palette (kept as module-level constants so other parts of the app can reuse them)
 PETROLEUM = "#0B3D54"
 PETROLEUM_LIGHT = "#154D6B"
@@ -70,7 +88,7 @@ def _img_b64(nombre_archivo):
         return None
 
 
-CONTACTO_DESTINATARIO = "pfsanchez@inti.gob.ar"
+CONTACTO_DESTINATARIO = "espectrometrika@gmail.com"
 
 
 def _zona_horaria_usuario():
@@ -785,14 +803,6 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
     st.caption("Preprocessing, exploratory analysis, classification & regression")
-
-    _inti_b64 = _img_b64("inti_logo.png")
-    if _inti_b64:
-        st.markdown(f"""
-        <div style="margin:10px 0 14px 0;">
-            <img src="{_inti_b64}" style="height:46px;">
-        </div>
-        """, unsafe_allow_html=True)
 
     with st.expander("📖 Theoretical guide (PDF)"):
         st.caption("A companion reference covering every tool in this app — preprocessing per "
