@@ -57,13 +57,13 @@ st.markdown(f"""
 <style>
 .block-container {{ padding-bottom: 3.5rem; }}
 .app-footer {{
-    position: fixed; right: 14px; bottom: 8px; z-index: 90;
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 90;
     text-align: right; font-size: 14px; font-weight: 500; color: #0B3D54;
-    padding: 3px 10px; border-radius: 8px;
-    background: rgba(255,255,255,.85); backdrop-filter: blur(4px);
+    padding: 6px 18px; border-top: 1px solid rgba(128,128,128,.25);
+    background: rgba(255,255,255,.88); backdrop-filter: blur(4px);
 }}
 @media (prefers-color-scheme: dark) {{
-    .app-footer {{ background: rgba(14,17,23,.85); color: #7FB8D0; }}
+    .app-footer {{ background: rgba(14,17,23,.88); color: #7FB8D0; }}
 }}
 </style>
 <div class="app-footer">{COPYRIGHT_TEXTO}</div>
