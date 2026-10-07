@@ -25,8 +25,9 @@ from email.message import EmailMessage
 import numpy as np
 import pandas as pd
 import streamlit as st
+from streamlit.errors import StreamlitAPIException
 import matplotlib.pyplot as plt
-import seaborn as sns
+import importlib.util
 import plotly.graph_objects as go
 import plotly.express as px
 import plotly.figure_factory as ff
@@ -77,15 +78,45 @@ TEAL_LIGHT = "#5EEAD4"
 TEAL_SOFT = "#E6FBF7"
 
 
-def _img_b64(nombre_archivo):
-    """Reads an image from assets/ and returns it as a base64 data URI, for inline HTML embedding."""
+@functools.lru_cache(maxsize=16)
+def _img_b64(nombre_archivo, max_w=None, max_h=None, paleta=False):
+    """Reads an image from assets/ and returns it as a base64 data URI for inline HTML.
+    Done ONCE per process (cached) and downscaled to the size it is really displayed at:
+    the original files are huge (up to ~850 KB) and were being re-encoded and re-sent to
+    the browser on every interaction."""
     ruta = os.path.join(os.path.dirname(__file__), "assets", nombre_archivo)
     try:
-        with open(ruta, "rb") as f:
-            datos = base64.b64encode(f.read()).decode()
+        try:
+            from PIL import Image
+            im = Image.open(ruta)
+            if max_w or max_h:
+                im.thumbnail((max_w or im.width, max_h or im.height), Image.LANCZOS)
+            buf = io.BytesIO()
+            if paleta:
+                im.convert("RGBA").quantize(256, method=Image.FASTOCTREE).save(buf, "PNG", optimize=True)
+            else:
+                im.save(buf, "PNG", optimize=True)
+            datos = base64.b64encode(buf.getvalue()).decode()
+        except Exception:                       # no PIL / odd file: send it as it is
+            with open(ruta, "rb") as f:
+                datos = base64.b64encode(f.read()).decode()
         return f"data:image/png;base64,{datos}"
     except FileNotFoundError:
         return None
+
+
+def _traza_espectro(eje, y, gl=False, **kw):
+    """One spectrum as a Plotly trace, light on the wire: values as float32 and, when the
+    spectral axis is evenly spaced, just (x0, dx) instead of repeating the whole axis in
+    every trace. A 264 x 700 spectra plot goes from ~6.5 MB to ~1 MB sent to the browser."""
+    eje = np.asarray(eje, dtype=float)
+    y = np.asarray(y, dtype=np.float32)
+    d = np.diff(eje)
+    if len(eje) > 2 and np.allclose(d, d[0], rtol=1e-6, atol=0):
+        extra = dict(x0=float(eje[0]), dx=float(d[0]))
+    else:
+        extra = dict(x=eje.astype(np.float32))
+    return (go.Scattergl if gl else go.Scatter)(y=y, **extra, **kw)
 
 
 CONTACTO_DESTINATARIO = "espectrometrika@gmail.com"
@@ -369,7 +400,7 @@ def _separador_csv(bytes_archivo):
     return sep, coma_decimal, n_campos
 
 
-@st.cache_data(show_spinner=False, max_entries=4)
+@st.cache_data(show_spinner=False, max_entries=16, ttl=3600)
 def _leer_crudo_cacheado(bytes_archivo, nombre_archivo):
     """Parses the file ONCE (no header assumed) and returns (sheet_names, {sheet: raw DataFrame},
     decimal_comma). Everything else (sheet list, raw preview, header row) is derived from this
@@ -425,7 +456,7 @@ def _aplicar_encabezado(raw, fila_encabezado, coma_decimal):
     return pd.DataFrame(columnas)
 
 
-@st.cache_data(show_spinner=False, max_entries=4)
+@st.cache_data(show_spinner=False, max_entries=16, ttl=3600)
 def _leer_archivo_cacheado(bytes_archivo, nombre_archivo, hoja, fila_encabezado):
     """Header-applied table, derived from the single cached parse of the file."""
     _, hojas, coma_decimal = _leer_crudo_cacheado(bytes_archivo, nombre_archivo)
@@ -433,7 +464,7 @@ def _leer_archivo_cacheado(bytes_archivo, nombre_archivo, hoja, fila_encabezado)
     return _aplicar_encabezado(raw, fila_encabezado, coma_decimal)
 
 
-@st.cache_data(show_spinner=False, max_entries=4)
+@st.cache_data(show_spinner=False, max_entries=16, ttl=3600)
 def _leer_preview_cacheada(bytes_archivo, nombre_archivo, hoja):
     """First rows of the raw table (no header assumed), for the 'raw preview' expander."""
     _, hojas, _ = _leer_crudo_cacheado(bytes_archivo, nombre_archivo)
@@ -441,7 +472,7 @@ def _leer_preview_cacheada(bytes_archivo, nombre_archivo, hoja):
     return raw.head(6).astype(str)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=12, ttl=3600)
 def _aplicar_pretratamiento_cacheado(X_paso0, secuencia):
     """Cached preprocessing: only recomputes when the raw data or the chosen
     steps/parameters actually change, not on every unrelated rerun."""
@@ -451,7 +482,7 @@ def _aplicar_pretratamiento_cacheado(X_paso0, secuencia):
     return X_pret
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=12, ttl=3600)
 def _calcular_linkage_cacheado(X_hca, metodo):
     """Cached hierarchical clustering: hierarchy.linkage does real (O(n^2)-O(n^3))
     work, and with no caching it was re-running on EVERY script rerun — even
@@ -461,7 +492,7 @@ def _calcular_linkage_cacheado(X_hca, metodo):
     return hierarchy.linkage(X_hca, method=metodo, metric="euclidean")
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner=False, max_entries=12, ttl=3600)
 def _ajustar_pca_cacheado(X_pca_input, n_comp_max):
     """Cached PCA fit. Uses cache_resource (not cache_data) because it
     returns the fitted scikit-learn PCA object itself, which other tabs
@@ -470,7 +501,7 @@ def _ajustar_pca_cacheado(X_pca_input, n_comp_max):
     return PCA(n_components=n_comp_max).fit(X_pca_input)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=12, ttl=3600)
 def _calcular_outliers_cacheado(X_pca_input, scores_completo, cargas_completo,
                                  autovalores, media_pca, n_comp, alpha):
     """Cached Hotelling's T² / residual Q computation for the Outliers tab."""
@@ -612,6 +643,16 @@ _instalar_persistencia_widgets()
 for _k in list(st.session_state.get("_reg", ())):
     if _k in st.session_state:       # re-assert (before any widget is drawn in this run)
         st.session_state[_k] = st.session_state[_k]
+
+
+def _rerun_tab():
+    """Refresh only the tab (fragment) where a button was pressed, instead of the whole app
+    (so the left panel and the other tabs are not redrawn). If for any reason we are not
+    inside a fragment rerun, fall back to a normal full rerun — never an error."""
+    try:
+        st.rerun(scope="fragment")
+    except StreamlitAPIException:
+        st.rerun()
 
 
 def hay_datos():
@@ -863,7 +904,7 @@ def aplicar_paso(X_in, paso_tup):
 # =============================================================================
 
 with st.sidebar:
-    _logo_b64 = _img_b64("logo_espectrometrika_solo.png")
+    _logo_b64 = _img_b64("logo_espectrometrika_solo.png", max_h=190, paleta=True)
     st.markdown(f"""
     <div style="margin-bottom:2px;">
         <img src="{_logo_b64}" style="height:46px; display:block;">
@@ -999,10 +1040,23 @@ with st.sidebar:
             df_completo.columns = [str(c) for c in df_completo.columns]
             columnas = list(df_completo.columns)
 
+            # Smart defaults: a column whose HEADER is not a number cannot be a spectral variable.
+            # The first text column is the sample ID; a numeric column with a text header is
+            # offered as the reference value, a text column as the class. (All can be changed.)
+            def _es_numero(txt):
+                try:
+                    float(str(txt).replace(",", "."))
+                    return True
+                except ValueError:
+                    return False
+            _id_def = columnas[0] if (columnas and not _es_numero(columnas[0])
+                                      and not pd.api.types.is_numeric_dtype(df_completo[columnas[0]])) else None
+            _extra = [c for c in columnas if c != _id_def and not _es_numero(c) and not c.startswith("Unnamed")]
+            _y_def = next((c for c in _extra if pd.api.types.is_numeric_dtype(df_completo[c])), None)
+            _cl_def = next((c for c in _extra if not pd.api.types.is_numeric_dtype(df_completo[c])), None)
             col1, col2 = st.columns(2)
             with col1:
-                _id_por_defecto = 1 if (len(df_completo.columns) > 0 and
-                                        not pd.api.types.is_numeric_dtype(df_completo.iloc[:, 0])) else 0
+                _id_por_defecto = 1 + columnas.index(_id_def) if _id_def is not None else 0
                 opcion_id = st.selectbox(
                     "Sample ID column",
                     ["(none — auto-generate)"] + columnas,
@@ -1015,6 +1069,7 @@ with st.sidebar:
                 opcion_clase = st.selectbox(
                     "Class column (for classification / SIMCA, if already in the file)",
                     ["(none)"] + columnas,
+                    index=1 + columnas.index(_cl_def) if _cl_def is not None else 0,
                     key=f"opcion_clase_{id_archivo}",
                     help="Which column holds the class/group label for each sample. Only use this for "
                          "a CATEGORICAL label (e.g. origin, variety). Leave as 'none' if you don't need "
@@ -1024,6 +1079,7 @@ with st.sidebar:
             opcion_valor_y = st.selectbox(
                 "Reference value column (for regression, if already in the file)",
                 ["(none)"] + columnas,
+                index=1 + columnas.index(_y_def) if _y_def is not None else 0,
                 key=f"opcion_valory_{id_archivo}",
                 help="Which column holds the continuous numeric value you want to predict with "
                      "regression (e.g. a lab-measured concentration). This is different from the class "
@@ -1244,7 +1300,7 @@ if hay_datos() and (st.session_state.get("X_pret") is None
                     or st.session_state.X_pret.shape[0] != st.session_state.X.shape[0]):
     reiniciar_pretratamiento()
 
-_logo_top_b64 = _img_b64("logo_espectrometrika_solo.png")
+_logo_top_b64 = _img_b64("logo_espectrometrika_solo.png", max_h=190, paleta=True)
 st.markdown(f"""
 <div style="margin-bottom:10px; margin-top:4px;">
     <img src="{_logo_top_b64}" style="height:30px; opacity:0.9; display:block;">
@@ -1290,7 +1346,7 @@ def _abierta(tab):
 # -----------------------------------------------------------------------
 if _abierta(tabs[0]):
     with tabs[0]:
-        _logo_hero_b64 = _img_b64("logo_espectrometrika_solo.png")
+        _logo_hero_b64 = _img_b64("logo_espectrometrika_solo.png", max_h=190, paleta=True)
         st.markdown(f"""
     <div style="margin-bottom:6px;">
         <img src="{_logo_hero_b64}" style="height:95px; display:block;">
@@ -1372,7 +1428,7 @@ if _abierta(tabs[0]):
         </div>
         """, unsafe_allow_html=True)
 
-        _hero_img_b64 = _img_b64("hero_spectra.png")
+        _hero_img_b64 = _img_b64("hero_spectra.png", max_w=1300, paleta=True)
         if _hero_img_b64:
             st.markdown(f"""
         <div style="margin-top:36px; text-align:center;">
@@ -1410,19 +1466,15 @@ if _abierta(tabs[1]):
             clases_unicas = np.unique(clases)
             colores_clase = {c: paleta[i % len(paleta)] for i, c in enumerate(clases_unicas)}
 
-        _grupos = np.unique(clases) if clases is not None else np.array(["all"])
-        for _g in _grupos:
-            _m = (clases == _g) if clases is not None else np.ones(X.shape[0], dtype=bool)
-            _Xg, _idg = X[_m], ids[_m]
-            _nv = _Xg.shape[1]
-            _xs = np.tile(np.append(np.asarray(st.session_state.numeros_onda, dtype=float), np.nan), _Xg.shape[0])
-            _ys = np.hstack([_Xg, np.full((_Xg.shape[0], 1), np.nan)]).ravel()
-            _hv = np.repeat(_idg.astype(str), _nv + 1)
-            fig.add_trace(go.Scattergl(
-                x=_xs, y=_ys, mode="lines", connectgaps=False,
-                line=dict(width=1, color=colores_clase[_g] if colores_clase is not None else "steelblue"),
-                opacity=0.6, name=str(_g) if clases is not None else "samples",
-                showlegend=clases is not None, hovertext=_hv, hoverinfo="text+x+y"))
+        _vistos = set()
+        for i in range(X.shape[0]):
+            _g = str(clases[i]) if clases is not None else "samples"
+            fig.add_trace(_traza_espectro(
+                st.session_state.numeros_onda, X[i], gl=(X.shape[0] > 500), mode="lines",
+                line=dict(width=1, color=colores_clase[clases[i]] if colores_clase is not None else "steelblue"),
+                opacity=0.6, name=_g, legendgroup=_g, showlegend=(clases is not None and _g not in _vistos),
+                hovertext=str(ids[i]), hoverinfo="text+x+y"))
+            _vistos.add(_g)
         fig.update_layout(height=450, xaxis_title="Wavenumber / wavelength", yaxis_title="Signal")
         if st.session_state.numeros_onda[0] > st.session_state.numeros_onda[-1]:
             fig.update_xaxes(autorange="reversed")
@@ -1607,7 +1659,7 @@ if _abierta(tabs[2]):
         with col_izq:
             fig1 = go.Figure()
             for i in range(min(X.shape[0], 60)):
-                fig1.add_trace(go.Scatter(x=numeros_onda_crudo, y=X[i],
+                fig1.add_trace(_traza_espectro(numeros_onda_crudo, X[i],
                                            mode="lines", line=dict(width=0.8), opacity=0.5,
                                            showlegend=False))
             fig1.update_layout(title="Before", height=380)
@@ -1617,7 +1669,7 @@ if _abierta(tabs[2]):
         with col_der:
             fig2 = go.Figure()
             for i in range(min(X_pret.shape[0], 60)):
-                fig2.add_trace(go.Scatter(x=numeros_onda_paso0, y=X_pret[i],
+                fig2.add_trace(_traza_espectro(numeros_onda_paso0, X_pret[i],
                                            mode="lines", line=dict(width=0.8), opacity=0.5,
                                            showlegend=False))
             fig2.update_layout(title="After", height=380)
@@ -1656,14 +1708,14 @@ if _abierta(tabs[2]):
             st.session_state.pasos_pretratamiento = [p for p in secuencia if p is not None]
             st.session_state.pret_propuesta_aplicada = _propuesta
             st.session_state.pret_desc_aplicada = " → ".join(nombres_mostrar) if nombres_mostrar else "none (raw spectra)"
-            st.rerun()
+            _rerun_tab()
         _es_crudo = (st.session_state.get("pret_propuesta_aplicada") == repr(((), None)))
         if col_ap2.button("↩ Reset (raw spectra)", key="pret_btn_reset",
                           disabled=_es_crudo and _ya_aplicada,
                           help="Goes back to the raw spectra and puts these settings back to 'None'."):
             resetear_prefijo("pret_w_")
             reiniciar_pretratamiento()
-            st.rerun()
+            _rerun_tab()
 
         # Light preview only (building and sending the whole table on every interaction
         # is slow for big datasets); the full files are generated on request below.
@@ -1727,7 +1779,7 @@ if _abierta(tabs[4]):
                                   help="Removes the PCA result — and the Outliers result and the PCA-based "
                                        "tools in 'Other tools', which are built on it. Nothing is recomputed."):
                 limpiar_pca()
-                st.rerun()
+                _rerun_tab()
             with col_btn_pca:
                 _texto_boton_pca = "▶ Compute PCA" if st.session_state.get("pca_completo") is None else "🔄 Update PCA"
                 if st.button(_texto_boton_pca, type="primary" if esta_desactualizado_pca else "secondary",
@@ -1750,7 +1802,7 @@ if _abierta(tabs[4]):
                         st.session_state.pca_ids = ids_actuales
                         st.session_state.pca_clases = clases_actuales
                         st.session_state.pca_firma = firma_modelos(_crop_mask_pca)
-                    st.rerun()
+                    _rerun_tab()
 
             if st.session_state.get("pca_completo") is None:
                 st.info("Click **Compute PCA** above to get started.")
@@ -1977,7 +2029,7 @@ if _abierta(tabs[5]):
                                  help="Removes the outlier result from the screen. Samples you already "
                                       "excluded stay excluded (use 'Restore all samples' to undo that)."):
                 limpiar_outliers()
-                st.rerun()
+                _rerun_tab()
             if _col_b_out.button(_texto_boton_out, type="primary" if esta_desactualizado_out else "secondary",
                                  key="btn_computar_outliers"):
                 with st.spinner("Computing T² / Q..."):
@@ -1992,7 +2044,7 @@ if _abierta(tabs[5]):
                     st.session_state.outliers_ids = ids
                     st.session_state.outliers_clases = clases
                     st.session_state.outliers_firma = _firma_outliers_actual
-                st.rerun()
+                _rerun_tab()
 
             if st.session_state.get("outliers_resultado") is None:
                 st.info("Click **Compute outliers** above to get started.")
@@ -2206,7 +2258,7 @@ if _abierta(tabs[6]):
                 }
                 st.session_state["dendro_firma"] = (firma_modelos(_crop_mask_den), metodo)
                 st.session_state["dendro_origen"] = "cropped" if _crop_mask_den is not None else "full"
-                st.rerun()
+                _rerun_tab()
 
             res = st.session_state.get("dendro_resultado")
             if res is None:
@@ -2313,7 +2365,7 @@ if _abierta(tabs[7]):
                     "cargas": np.array(st.session_state.cargas_completo),
                     "eje": np.array(st.session_state.pca_eje)}
                 st.session_state["otros_loadings_firma"] = _firma
-                st.rerun()
+                _rerun_tab()
             r = st.session_state.get("otros_loadings_resultado")
             if r is None:
                 st.info("Click **Compute** to draw the loadings of the PCA you computed.")
@@ -2338,7 +2390,7 @@ if _abierta(tabs[7]):
                     "cargas": np.array(st.session_state.cargas_completo),
                     "eje": np.array(st.session_state.pca_eje)}
                 st.session_state["otros_ranking_firma"] = _firma
-                st.rerun()
+                _rerun_tab()
             r = st.session_state.get("otros_ranking_resultado")
             if r is None:
                 st.info("Click **Compute** to rank the variables by their weight in a principal component.")
@@ -2368,7 +2420,7 @@ if _abierta(tabs[7]):
                     "autovalores": np.array(st.session_state.autovalores),
                     "eje": np.array(st.session_state.pca_eje)}
                 st.session_state["otros_corr_firma"] = _firma
-                st.rerun()
+                _rerun_tab()
             r = st.session_state.get("otros_corr_resultado")
             if r is None:
                 st.info("Click **Compute** to draw the loadings correlation plot of the PCA you computed.")
@@ -2418,7 +2470,7 @@ if _abierta(tabs[7]):
                     st.session_state["otros_media_resultado"] = {"por_clase": por_clase, "eje": eje_vivo.copy()}
                     st.session_state["otros_media_firma"] = _firma
                     st.session_state["otros_media_origen"] = "cropped" if _crop_mask_otros is not None else "full"
-                    st.rerun()
+                    _rerun_tab()
                 r = st.session_state.get("otros_media_resultado")
                 if r is None:
                     st.info("Click **Compute** to get the mean spectrum (± standard deviation) of each class.")
@@ -2445,6 +2497,7 @@ if _abierta(tabs[7]):
             if barra_control("otros_cm", _firma, "This clustermap"):
                 with st.spinner("Clustering and drawing the heatmap — this can take a while with many samples..."):
                     df_heat = pd.DataFrame(X_vivo, index=ids_vivo, columns=np.round(eje_vivo, 0))
+                    import seaborn as sns
                     fig_cm = sns.clustermap(df_heat, method=metodo_cm, metric="euclidean",
                                              col_cluster=False, cmap="viridis", figsize=(10, 7),
                                              xticklabels=False)
@@ -2454,7 +2507,7 @@ if _abierta(tabs[7]):
                 st.session_state["otros_cm_resultado"] = {"png": _buf.getvalue(), "metodo": metodo_cm}
                 st.session_state["otros_cm_firma"] = _firma
                 st.session_state["otros_cm_origen"] = "cropped" if _crop_mask_otros is not None else "full"
-                st.rerun()
+                _rerun_tab()
             r = st.session_state.get("otros_cm_resultado")
             if r is None:
                 st.info("Choose the linkage method and click **Compute**. This is one of the heavier "
@@ -2476,7 +2529,7 @@ if _abierta(tabs[7]):
                 st.session_state["otros_tsne_resultado"] = {"emb": emb, "ids": ids_vivo, "clases": clases_vivo}
                 st.session_state["otros_tsne_firma"] = _firma
                 st.session_state["otros_tsne_origen"] = "cropped" if _crop_mask_otros is not None else "full"
-                st.rerun()
+                _rerun_tab()
             r = st.session_state.get("otros_tsne_resultado")
             if r is None:
                 st.info("Set the perplexity and click **Compute**.")
@@ -2490,21 +2543,22 @@ if _abierta(tabs[7]):
 
         # ------------------------------------------------------------------ UMAP
         elif herramienta == "UMAP":
-            try:
-                import umap
-            except ImportError:
+            if importlib.util.find_spec("umap") is None:     # check only; importing umap takes ~25 s
                 st.error("The `umap-learn` package is missing (pip install umap-learn) for this option.")
             else:
+                st.caption("⏱ The first UMAP run after the app starts takes longer (30–60 s: the library "
+                           "compiles itself once). Later runs are fast.")
                 vecinos = st.slider("n_neighbors", 2, min(50, max(3, n_vivo - 1)), min(15, max(3, n_vivo - 1)),
                                      key="otros_w_umap_vecinos")
                 _firma = (firma_modelos(_crop_mask_otros), vecinos)
                 if barra_control("otros_umap", _firma, "This UMAP map"):
-                    with st.spinner("Computing UMAP..."):
+                    with st.spinner("Computing UMAP... (first time: up to a minute)"):
+                        import umap
                         emb = umap.UMAP(n_components=2, n_neighbors=vecinos, random_state=0).fit_transform(X_vivo)
                     st.session_state["otros_umap_resultado"] = {"emb": emb, "ids": ids_vivo, "clases": clases_vivo}
                     st.session_state["otros_umap_firma"] = _firma
                     st.session_state["otros_umap_origen"] = "cropped" if _crop_mask_otros is not None else "full"
-                    st.rerun()
+                    _rerun_tab()
                 r = st.session_state.get("otros_umap_resultado")
                 if r is None:
                     st.info("Set n_neighbors and click **Compute**.")
@@ -2538,7 +2592,7 @@ if _abierta(tabs[7]):
                     "res": resultado_mcr, "ids": ids_vivo, "eje": eje_vivo.copy(), "n": n_componentes_mcr}
                 st.session_state["otros_mcr_firma"] = _firma
                 st.session_state["otros_mcr_origen"] = "cropped" if _crop_mask_otros is not None else "full"
-                st.rerun()
+                _rerun_tab()
             r = st.session_state.get("otros_mcr_resultado")
             if r is None:
                 st.info("Choose the number of components and click **Run MCR-ALS**.")
@@ -2594,7 +2648,7 @@ if _abierta(tabs[9]):
                      help="Clears all trained models, metrics, and plots from this tab, so you can "
                           "start a completely fresh run without any leftover results from before."):
             resetear_prefijo("clf_")
-            st.rerun()
+            _rerun_tab()
 
         ids_activos, X_activo_clf, clases_activas = datos_activos()
         X_modelado = st.session_state.X_pret[indice_activo()]
@@ -2841,7 +2895,7 @@ if _abierta(tabs[9]):
                     _r["completo"] = True
                     _guardar_clf()
                     if _incompleto_clf:      # redraw: the 'incomplete run' banner above is now outdated
-                        st.rerun()
+                        _rerun_tab()
 
                 if "clf_resultados" in st.session_state:
                     resultados = st.session_state["clf_resultados"]
@@ -3213,7 +3267,7 @@ if _abierta(tabs[10]):
                      help="Clears all trained SIMCA models and results from this tab, so you can start "
                           "a completely fresh run without any leftover results from before."):
             resetear_prefijo("simca_")
-            st.rerun()
+            _rerun_tab()
         st.caption("Unlike LDA/PLS-DA/Random Forest (which always force a pick among the trained "
                    "classes), SIMCA builds one PCA model PER CLASS and asks, independently for each "
                    "one, 'does this sample look like a member of this class?'. A sample can end up "
@@ -3351,7 +3405,7 @@ if _abierta(tabs[10]):
                     st.session_state["simca_crop_desc"] = st.session_state.get("crop_desc_aplicada")
                     _rs["completo"] = True
                     if _incompleto_simca:      # redraw: the 'incomplete run' banner above is now outdated
-                        st.rerun()
+                        _rerun_tab()
 
                 if "simca_modelos" in st.session_state:
                     modelos_simca = st.session_state["simca_modelos"]
@@ -3530,7 +3584,7 @@ if _abierta(tabs[11]):
                      help="Clears all trained models, metrics, and plots from this tab, so you can "
                           "start a completely fresh run without any leftover results from before."):
             resetear_prefijo("reg_")
-            st.rerun()
+            _rerun_tab()
 
         if st.session_state.valores_y is None:
             st.markdown("**Reference value (continuous Y variable)**")
@@ -3827,7 +3881,7 @@ if _abierta(tabs[11]):
                     _rr["completo"] = True
                     _guardar_reg()
                     if _incompleto_reg:      # redraw: the 'incomplete run' banner above is now outdated
-                        st.rerun()
+                        _rerun_tab()
 
                 if "reg_resultados" in st.session_state:
                     resultados_r = st.session_state["reg_resultados"]
@@ -4272,7 +4326,7 @@ if _abierta(tabs[12]):
                         else:
                             st.session_state.modelos_guardados[nombre_cargado] = bundle_cargado
                             st.success(f"Model '{nombre_cargado}' loaded successfully.")
-                            st.rerun()
+                            _rerun_tab()
                     except Exception as e:
                         st.error(f"Could not load the file: {e}")
 
@@ -4491,7 +4545,7 @@ if _abierta(tabs[12]):
             st.divider()
             if st.button("🗑️ Delete all saved models"):
                 st.session_state.modelos_guardados = {}
-                st.rerun()
+                _rerun_tab()
     with tabs[12]:
         _frag_tab_12()
 
@@ -4605,7 +4659,7 @@ if _abierta(tabs[13]):
                 if _d2.button("🧹 Clear", key="inf_btn_clear",
                               help="Removes the built report from memory."):
                     st.session_state.pop("informe_final", None)
-                    st.rerun()
+                    _rerun_tab()
     with tabs[13]:
         _frag_tab_13()
 
@@ -4658,7 +4712,7 @@ if _abierta(tabs[3]):
                     st.warning("'From' and 'To' are the same value.")
                 else:
                     _borrador.append([float(min(_desde, _hasta)), float(max(_desde, _hasta))])
-                    st.rerun()
+                    _rerun_tab()
 
             # quick presets (only those that fall inside this axis)
             _atajos = [("Water bending band (1600–1700)", 1600, 1700), ("CO₂ (2280–2400)", 2280, 2400),
@@ -4670,7 +4724,7 @@ if _abierta(tabs[3]):
                 for _col, (_nom, _lo, _hi) in zip(_cols_a, _atajos):
                     if _col.button(_nom, key=f"crop_btn_atajo_{_lo}"):
                         _borrador.append([float(_lo), float(_hi)])
-                        st.rerun()
+                        _rerun_tab()
 
             # ---- current list of regions ------------------------------------------------
             if _borrador:
@@ -4680,10 +4734,10 @@ if _abierta(tabs[3]):
                     _cc1.markdown(f"{_i + 1}. {_lo:g} – {_hi:g}")
                     if _cc2.button("✖", key=f"crop_btn_del_{_i}", help="Remove this region from the list"):
                         _borrador.pop(_i)
-                        st.rerun()
+                        _rerun_tab()
                 if st.button("🗑️ Remove all regions from the list", key="crop_btn_vaciar"):
                     st.session_state["crop_borrador"] = []
-                    st.rerun()
+                    _rerun_tab()
             else:
                 st.info("No regions yet. Add them above, or draw a box over the plot below.")
 
@@ -4693,7 +4747,7 @@ if _abierta(tabs[3]):
             _fig_c = go.Figure()
             _idx_show = np.linspace(0, _X_c.shape[0] - 1, min(40, _X_c.shape[0])).astype(int)
             for _i in _idx_show:
-                _fig_c.add_trace(go.Scatter(x=_eje_c, y=_X_c[_i], mode="lines", showlegend=False,
+                _fig_c.add_trace(_traza_espectro(_eje_c, _X_c[_i], mode="lines", showlegend=False,
                                             line=dict(width=0.6, color="rgba(120,120,120,0.35)"),
                                             hoverinfo="skip"))
             _fig_c.add_trace(go.Scatter(x=_eje_c, y=_X_c.mean(axis=0), mode="lines", name="Mean spectrum",
@@ -4723,7 +4777,7 @@ if _abierta(tabs[3]):
                     st.success(f"Selected on the plot: {_s_lo:.3f} – {_s_hi:.3f}")
                     if st.button("➕ Add the selected range as a region", key="crop_btn_agregar_sel"):
                         _borrador.append([_s_lo, _s_hi])
-                        st.rerun()
+                        _rerun_tab()
             else:
                 st.caption("Tip: drag a box over the plot to select a region, then click 'Add the selected range'.")
 
@@ -4737,7 +4791,7 @@ if _abierta(tabs[3]):
                 with st.expander("Preview of the cropped spectra (gaps = removed regions)"):
                     _fig_v = go.Figure()
                     for _i in _idx_show[:15]:
-                        _fig_v.add_trace(go.Scatter(x=_eje_c, y=np.where(_mask_prev, _X_c[_i], np.nan),
+                        _fig_v.add_trace(_traza_espectro(_eje_c, np.where(_mask_prev, _X_c[_i], np.nan),
                                                     mode="lines", showlegend=False, line=dict(width=0.8)))
                     _fig_v.update_layout(height=320, xaxis_title="Axis", yaxis_title="Signal")
                     if _eje_c[0] > _eje_c[-1]:
@@ -4757,11 +4811,11 @@ if _abierta(tabs[3]):
                                "they used the crop."):
                 st.session_state["crop_aplicado"] = _propuesta
                 st.session_state["crop_desc_aplicada"] = sc.describir_recorte(_propuesta)
-                st.rerun()
+                _rerun_tab()
             if _a2.button("↩ Reset (no crop)", key="crop_btn_reset", disabled=_aplicado is None):
                 st.session_state.pop("crop_aplicado", None)
                 st.session_state.pop("crop_desc_aplicada", None)
-                st.rerun()
+                _rerun_tab()
     with tabs[3]:
         _frag_tab_3()
 
@@ -4856,10 +4910,11 @@ if _abierta(tabs[8]):
                     _cv_s = _s1.slider("Cross-validation folds", 3, 10, 5, key="scr_w_cv",
                                        help="Fewer folds = faster.") if _tarea != "SIMCA" else 5
                     _prop_s = _s2.slider("Independent test set (%)", 15, 40, 25, key="scr_w_prop") / 100
-                    _opt_s = _s3.checkbox("Optimize hyperparameters (fastest preset)", value=True, key="scr_w_opt",
+                    _opt_s = _s3.checkbox("Optimize hyperparameters (fastest preset)", value=False, key="scr_w_opt",
                                           disabled=_tarea == "SIMCA",
-                                          help="Random search over 8 combinations — the quickest option. "
-                                               "Turn it off for an even faster, rougher screening.")
+                                          help="Random search over 8 combinations — the quickest search option, but it still "
+                                               "multiplies the time by several. Off by default: screen first, then "
+                                               "optimize the best candidates in the Classification / Regression tabs.")
                     _b1, _b2, _b3 = st.columns(3)
                     _bor_s = _b1.number_input("Boruta iterations", 10, 500, 50, step=10, key="scr_w_bor")
                     _gap_s = _b2.number_input("Genetic algorithm: population", 6, 60, 12, step=2, key="scr_w_gap")
@@ -4892,7 +4947,7 @@ if _abierta(tabs[8]):
                 if _r3.button("🧹 Clear", key="scr_btn_clear", disabled=not _filas_s):
                     st.session_state.pop("scr_filas", None)
                     st.session_state.pop("scr_estado", None)
-                    st.rerun()
+                    _rerun_tab()
 
                 if _iniciar or _reanudar:
                     if _iniciar:
@@ -4933,7 +4988,7 @@ if _abierta(tabs[8]):
                                 al_terminar_fila=lambda f: st.session_state["scr_filas"].append(f),
                                 progreso=_progreso_scr, ya_hechas=_ya)
                     st.session_state["scr_estado"]["completo"] = True
-                    st.rerun()
+                    _rerun_tab()
 
                 # ---------------- results
                 if _filas_s:

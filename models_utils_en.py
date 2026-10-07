@@ -37,6 +37,46 @@ from sklearn.metrics import (
 )
 from xgboost import XGBClassifier, XGBRegressor
 
+
+# -----------------------------------------------------------------------------
+# CPU budget. Cloud containers often report the CPU count of the whole host (e.g. 32+)
+# while the app is only allowed to use 1-2 CPUs. With n_jobs=-1 every parallel step then
+# starts dozens of workers that fight for those few CPUs (and copy the data in memory):
+# the app becomes SLOWER and can freeze or run out of memory. We detect the CPUs the
+# container may really use and use at most that many (max 4) for the outer parallel loop;
+# the models inside it stay single-threaded so the work is never multiplied.
+# -----------------------------------------------------------------------------
+import math
+import os
+
+
+def _cpus_efectivos():
+    try:
+        n = len(os.sched_getaffinity(0))
+    except Exception:
+        n = os.cpu_count() or 1
+    try:                                    # cgroup v2
+        cuota, periodo = open("/sys/fs/cgroup/cpu.max").read().split()[:2]
+        if cuota != "max":
+            n = min(n, max(1, math.ceil(int(cuota) / int(periodo))))
+    except Exception:
+        try:                                # cgroup v1
+            cuota = int(open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read())
+            periodo = int(open("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read())
+            if cuota > 0:
+                n = min(n, max(1, math.ceil(cuota / periodo)))
+        except Exception:
+            pass
+    return max(1, n)
+
+
+N_JOBS = max(1, min(4, _cpus_efectivos()))
+try:                                        # BLAS / OpenMP threads: same budget
+    from threadpoolctl import threadpool_limits
+    threadpool_limits(limits=N_JOBS)
+except Exception:
+    pass
+
 optuna.logging.set_verbosity(optuna.logging.WARNING)  # keep Optuna's trial-by-trial log quiet
 
 
@@ -230,7 +270,8 @@ class XGBClassifierWrapper(BaseEstimator, ClassifierMixin):
         self.modelo_ = XGBClassifier(
             n_estimators=self.n_estimators, max_depth=self.max_depth,
             learning_rate=self.learning_rate, eval_metric=self.eval_metric,
-            random_state=self.random_state, n_jobs=-1,
+            random_state=self.random_state, n_jobs=1,
+            colsample_bytree=0.3, max_bin=64,   # fast on spectra with hundreds of variables
         )
         self.modelo_.fit(X, y_enc)
         self.classes_ = self.encoder_.classes_
@@ -255,13 +296,13 @@ def crear_clasificadores(n_componentes_pls=5, random_state=0):
         "PLS-DA": PLSDAClassifier(n_components=n_componentes_pls),
         "Logistic Regression": LogisticRegression(max_iter=2000),
         "Naive Bayes": GaussianNB(),
-        "Random Forest": RandomForestClassifier(n_estimators=300, random_state=random_state, n_jobs=-1),
+        "Random Forest": RandomForestClassifier(n_estimators=300, random_state=random_state, n_jobs=1),
         "SVM": SVC(kernel="rbf", probability=True, random_state=random_state),
         "Decision Tree": DecisionTreeClassifier(random_state=random_state),
         "XGBoost": XGBClassifierWrapper(
-            n_estimators=300, eval_metric="mlogloss", random_state=random_state,
+            n_estimators=200, eval_metric="mlogloss", random_state=random_state,
         ),
-        "KNN": KNeighborsClassifier(n_neighbors=5, n_jobs=-1),
+        "KNN": KNeighborsClassifier(n_neighbors=5, n_jobs=1),
         "Neural Network (MLP)": MLPClassifierWrapper(
             hidden_layer_sizes=(50,), max_iter=500, early_stopping=True,
             n_iter_no_change=15, random_state=random_state,
@@ -278,11 +319,11 @@ def crear_regresores(n_componentes_pls=5, random_state=0):
         "Lasso": Lasso(alpha=0.01, max_iter=20000),
         "Ridge": Ridge(alpha=1.0),
         "Elastic Net": ElasticNet(alpha=0.01, l1_ratio=0.5, max_iter=20000),
-        "Random Forest": RandomForestRegressor(n_estimators=300, random_state=random_state, n_jobs=-1),
+        "Random Forest": RandomForestRegressor(n_estimators=200, max_features=0.2, random_state=random_state, n_jobs=1),
         "SVM (SVR)": SVR(kernel="rbf"),
         "Decision Tree": DecisionTreeRegressor(random_state=random_state),
-        "XGBoost": XGBRegressor(n_estimators=300, random_state=random_state, n_jobs=-1),
-        "KNN": KNeighborsRegressor(n_neighbors=5, n_jobs=-1),
+        "XGBoost": XGBRegressor(n_estimators=200, colsample_bytree=0.3, max_bin=64, random_state=random_state, n_jobs=1),
+        "KNN": KNeighborsRegressor(n_neighbors=5, n_jobs=1),
         "Neural Network (MLP)": MLPRegressorWrapper(
             hidden_layer_sizes=(50,), max_iter=500, early_stopping=True,
             n_iter_no_change=15, random_state=random_state,
@@ -300,7 +341,7 @@ GRILLAS_CLASIFICACION = {
     "Logistic Regression": {"C": [0.01, 0.1, 1, 10, 100]},
     "Naive Bayes": {"var_smoothing": [1e-9, 1e-7, 1e-5]},
     "Random Forest": {"n_estimators": [100, 200, 300], "max_depth": [None, 10, 20],
-                       "max_features": ["sqrt", "log2", None]},
+                       "max_features": ["sqrt", "log2", 0.3]},
     "SVM": {"C": [0.1, 1, 10, 100], "gamma": ["scale", "auto", 0.01, 0.1]},
     "Decision Tree": {"max_depth": [None, 3, 5, 10, 20]},
     "XGBoost": {"n_estimators": [100, 200, 300], "max_depth": [3, 5, 7], "learning_rate": [0.05, 0.1, 0.3]},
@@ -315,7 +356,7 @@ GRILLAS_REGRESION = {
     "Ridge": {"alpha": [0.01, 0.1, 1, 10, 100]},
     "Elastic Net": {"alpha": [0.001, 0.01, 0.1, 1], "l1_ratio": [0.1, 0.5, 0.9]},
     "Random Forest": {"n_estimators": [100, 200, 300], "max_depth": [None, 10, 20],
-                       "max_features": [1.0, "sqrt", "log2"]},
+                       "max_features": [0.3, "sqrt", "log2"]},
     "SVM (SVR)": {"C": [0.1, 1, 10, 100], "gamma": ["scale", "auto", 0.01, 0.1], "epsilon": [0.01, 0.1, 0.5]},
     "Decision Tree": {"max_depth": [None, 3, 5, 10, 20]},
     "XGBoost": {"n_estimators": [100, 200, 300], "max_depth": [3, 5, 7], "learning_rate": [0.05, 0.1, 0.3]},
@@ -397,13 +438,13 @@ def optimizar_hiperparametros(modelo, grilla, X, y, es_clasificacion, cv=5,
     es_loo = isinstance(cv, str) and cv.upper() == "LOO"
 
     if metodo == "grid":
-        buscador = GridSearchCV(modelo, grilla, scoring=scoring, cv=splitter, n_jobs=-1)
+        buscador = GridSearchCV(modelo, grilla, scoring=scoring, cv=splitter, n_jobs=N_JOBS)
         descripcion = "Grid search (exhaustive, legacy option)"
 
     elif metodo == "random":
         buscador = RandomizedSearchCV(
             modelo, grilla, scoring=scoring, cv=splitter, n_iter=n_iter,
-            random_state=random_state, n_jobs=-1,
+            random_state=random_state, n_jobs=N_JOBS,
         )
         descripcion = f"Random search ({n_iter} combinations, legacy option)"
 
@@ -411,7 +452,7 @@ def optimizar_hiperparametros(modelo, grilla, X, y, es_clasificacion, cv=5,
         n_iter_real = min(n_iter, 8) if n_iter else 8
         buscador = RandomizedSearchCV(
             modelo, grilla, scoring=scoring, cv=splitter, n_iter=n_iter_real,
-            random_state=random_state, n_jobs=-1,
+            random_state=random_state, n_jobs=N_JOBS,
         )
         descripcion = f"Fast (random search, {n_iter_real} combinations tried)"
 
@@ -424,14 +465,14 @@ def optimizar_hiperparametros(modelo, grilla, X, y, es_clasificacion, cv=5,
         # n_estimators-based halving is unaffected (it never touches sample
         # counts), so only fall back for that specific combination.
         if n_muestras < UMBRAL_MUESTRAS_HALVING or (es_loo and recurso_probable == "n_samples"):
-            buscador = GridSearchCV(modelo, grilla, scoring=scoring, cv=splitter, n_jobs=-1)
+            buscador = GridSearchCV(modelo, grilla, scoring=scoring, cv=splitter, n_jobs=N_JOBS)
             motivo = "dataset too small for successive halving" if n_muestras < UMBRAL_MUESTRAS_HALVING \
                 else "successive halving isn't compatible with LOO for this model"
             descripcion = f"Thorough (full grid search — {motivo})"
         else:
             recurso, grilla_reducida, min_r, max_r = _elegir_recurso_halving(grilla)
             kwargs = dict(estimator=modelo, param_grid=grilla_reducida, scoring=scoring,
-                          cv=splitter, factor=3, resource=recurso, random_state=random_state, n_jobs=-1)
+                          cv=splitter, factor=3, resource=recurso, random_state=random_state, n_jobs=N_JOBS)
             if recurso == "n_estimators":
                 kwargs["min_resources"] = min_r
                 kwargs["max_resources"] = max_r
@@ -457,7 +498,7 @@ def optimizar_hiperparametros(modelo, grilla, X, y, es_clasificacion, cv=5,
             mapa_valores = {nombre: {str(v): v for v in valores} for nombre, valores in grilla.items()}
             params_reales = {k: mapa_valores[k][v] for k, v in params.items()}
             modelo_prueba = clone(modelo).set_params(**params_reales)
-            puntajes = cross_val_score(modelo_prueba, X, y, cv=splitter, scoring=scoring, n_jobs=-1)
+            puntajes = cross_val_score(modelo_prueba, X, y, cv=splitter, scoring=scoring, n_jobs=N_JOBS)
             return float(np.mean(puntajes))
 
         estudio = optuna.create_study(
@@ -478,7 +519,7 @@ def optimizar_hiperparametros(modelo, grilla, X, y, es_clasificacion, cv=5,
         if n_muestras < UMBRAL_MUESTRAS_HALVING or (es_loo and recurso_probable == "n_samples"):
             buscador = RandomizedSearchCV(
                 modelo, grilla, scoring=scoring, cv=splitter, n_iter=15,
-                random_state=random_state, n_jobs=-1,
+                random_state=random_state, n_jobs=N_JOBS,
             )
             motivo = "dataset too small for successive halving" if n_muestras < UMBRAL_MUESTRAS_HALVING \
                 else "successive halving isn't compatible with LOO for this model"
@@ -486,7 +527,7 @@ def optimizar_hiperparametros(modelo, grilla, X, y, es_clasificacion, cv=5,
         else:
             recurso, grilla_reducida, min_r, max_r = _elegir_recurso_halving(grilla)
             kwargs = dict(estimator=modelo, param_distributions=grilla_reducida, scoring=scoring,
-                          cv=splitter, factor=3, resource=recurso, random_state=random_state, n_jobs=-1)
+                          cv=splitter, factor=3, resource=recurso, random_state=random_state, n_jobs=N_JOBS)
             if recurso == "n_estimators":
                 kwargs["min_resources"] = min_r
                 kwargs["max_resources"] = max_r
@@ -539,12 +580,12 @@ def evaluar_clasificacion(modelo, X, y, cv=5, random_state=0):
                 "cruzada (se necesitan al menos 2 muestras por clase)."
             )
     splitter, cv_real = construir_particionador(cv, y, es_clasificacion=True, random_state=random_state)
-    y_pred = cross_val_predict(modelo, X, y, cv=splitter, n_jobs=-1)
+    y_pred = cross_val_predict(modelo, X, y, cv=splitter, n_jobs=N_JOBS)
 
     auc = None
     if hasattr(modelo, "predict_proba"):
         try:
-            y_proba = cross_val_predict(modelo, X, y, cv=splitter, method="predict_proba", n_jobs=-1)
+            y_proba = cross_val_predict(modelo, X, y, cv=splitter, method="predict_proba", n_jobs=N_JOBS)
             clases_unicas = np.unique(y)
             if len(clases_unicas) == 2:
                 auc = float(roc_auc_score((y == clases_unicas[1]).astype(int), y_proba[:, 1]))
@@ -577,7 +618,7 @@ def evaluar_regresion(modelo, X, y, cv=5, random_state=0):
     predicción fuera de bolsa."""
     y = np.asarray(y, dtype=float)
     splitter, cv_real = construir_particionador(cv, y, es_clasificacion=False, random_state=random_state)
-    y_pred = cross_val_predict(modelo, X, y, cv=splitter, n_jobs=-1)
+    y_pred = cross_val_predict(modelo, X, y, cv=splitter, n_jobs=N_JOBS)
 
     rmse = float(np.sqrt(mean_squared_error(y, y_pred)))
     q75, q25 = np.percentile(y, [75, 25])
@@ -865,9 +906,9 @@ def seleccionar_variables_boruta(X, y, es_clasificacion, random_state=0, max_ite
     from boruta import BorutaPy
 
     if es_clasificacion:
-        estimador = RandomForestClassifier(n_estimators=200, random_state=random_state, n_jobs=-1)
+        estimador = RandomForestClassifier(n_estimators=200, random_state=random_state, n_jobs=N_JOBS)
     else:
-        estimador = RandomForestRegressor(n_estimators=200, random_state=random_state, n_jobs=-1)
+        estimador = RandomForestRegressor(n_estimators=200, random_state=random_state, n_jobs=N_JOBS)
 
     seleccionador = BorutaPy(
         estimador, n_estimators="auto", random_state=random_state, max_iter=max_iter,
@@ -918,12 +959,12 @@ class SeleccionGenetica:
                 if cv_real < 2:
                     return -np.inf
                 skf = StratifiedKFold(n_splits=cv_real, shuffle=True, random_state=self.random_state)
-                y_pred = cross_val_predict(self.modelo_evaluador, X_sub, y, cv=skf, n_jobs=-1)
+                y_pred = cross_val_predict(self.modelo_evaluador, X_sub, y, cv=skf, n_jobs=N_JOBS)
                 desempeno = balanced_accuracy_score(y, y_pred)
             else:
                 cv_real = min(self.cv, X_sub.shape[0])
                 kf = KFold(n_splits=cv_real, shuffle=True, random_state=self.random_state)
-                y_pred = cross_val_predict(self.modelo_evaluador, X_sub, y, cv=kf, n_jobs=-1)
+                y_pred = cross_val_predict(self.modelo_evaluador, X_sub, y, cv=kf, n_jobs=N_JOBS)
                 desempeno = r2_score(y, y_pred)
         except Exception:
             return -np.inf
@@ -1046,7 +1087,7 @@ def calcular_curva_aprendizaje(modelo, X, y, es_clasificacion, cv=5,
 
     train_sizes_abs, train_scores, val_scores = learning_curve(
         modelo, X, y, cv=splitter, scoring=scoring, train_sizes=train_sizes,
-        n_jobs=-1, random_state=random_state,
+        n_jobs=N_JOBS, random_state=random_state,
     )
     return {
         "train_sizes": train_sizes_abs,
@@ -1160,7 +1201,7 @@ def comparar_modelos_estadisticamente(modelos_dict, X, y, es_clasificacion, cv=5
     puntajes = {}
     for nombre, modelo in modelos_dict.items():
         try:
-            puntajes[nombre] = cross_val_score(modelo, X, y, cv=splitter, scoring=scoring, n_jobs=-1)
+            puntajes[nombre] = cross_val_score(modelo, X, y, cv=splitter, scoring=scoring, n_jobs=N_JOBS)
         except Exception:
             puntajes[nombre] = None
 
