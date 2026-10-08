@@ -14,3 +14,4 @@ joblib
 fpdf2
 optuna
 requests
+python-calamine
