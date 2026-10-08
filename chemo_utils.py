@@ -636,3 +636,47 @@ def mcr_als(D, n_componentes, max_iter=100, tol=1e-6, no_negatividad=True, rando
         lof_anterior = lof
 
     return {"C": C, "S": S_mat, "lof_pct": lof, "n_iter": n_iter_usadas}
+
+
+def alinear_intervalos(X, eje, n_intervalos=40, max_desp=0.02, ref=None):
+    """
+    Alineamiento de picos por intervalos (idea de icoshift): el espectro se corta
+    en n_intervalos tramos; en cada tramo cada muestra se desplaza (hasta +-max_desp,
+    en unidades del eje, p.ej. ppm) para maximizar su correlacion con el espectro de
+    referencia (mediana de las muestras, o 'ref' si se da). Corrige corrimientos de
+    banda (pH, fuerza ionica, temperatura, deriva de tiempo de retencion...). El eje
+    NO cambia. Devuelve (X_alineado, desplazamientos[n_muestras, n_intervalos] en puntos).
+    """
+    X = np.asarray(X, dtype=float)
+    eje = np.asarray(eje, dtype=float)
+    n, p = X.shape
+    paso = float(np.median(np.abs(np.diff(eje)))) if p > 1 else 1.0
+    m = int(max(1, min(round(max_desp / max(paso, 1e-12)), p // 4, 80)))   # tope: costo ~ (2m+1) pasadas
+    r = np.nanmedian(X, axis=0) if ref is None else np.asarray(ref, dtype=float)
+    Xp = np.pad(X, ((0, 0), (m, m)), mode="edge")
+    bordes = np.linspace(0, p, int(max(1, n_intervalos)) + 1).astype(int)
+    salida = np.empty_like(X)
+    desp = np.zeros((n, len(bordes) - 1), dtype=int)
+    for k in range(len(bordes) - 1):
+        a, b = bordes[k], bordes[k + 1]
+        if b - a < 3:
+            salida[:, a:b] = X[:, a:b]
+            continue
+        rr = r[a:b] - r[a:b].mean()
+        rn = np.linalg.norm(rr)
+        mejor = np.full(n, -np.inf)
+        s_mej = np.zeros(n, dtype=int)
+        for s in range(-m, m + 1):
+            seg = Xp[:, a + m - s:b + m - s]          # contenido desplazado s puntos
+            sc = seg - seg.mean(axis=1, keepdims=True)
+            den = np.linalg.norm(sc, axis=1) * rn
+            cor = np.where(den > 0, (sc @ rr) / np.where(den > 0, den, 1), -np.inf)
+            # empates: preferir el desplazamiento menor
+            cor = cor - 1e-9 * abs(s)
+            mj = cor > mejor
+            mejor[mj] = cor[mj]
+            s_mej[mj] = s
+        desp[:, k] = s_mej
+        idx = (np.arange(a, b)[None, :] + m) - s_mej[:, None]
+        salida[:, a:b] = np.take_along_axis(Xp, idx, axis=1)
+    return salida, desp

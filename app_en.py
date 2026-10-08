@@ -31,10 +31,14 @@ import importlib.util
 import plotly.graph_objects as go
 import plotly.express as px
 import plotly.figure_factory as ff
+from plotly.subplots import make_subplots
 from scipy.cluster import hierarchy
 from sklearn.decomposition import PCA
 
 import chemo_utils as cu
+import pc_finder as pcf
+import tabular_utils as tu
+import nl_finder as nlf
 import models_utils_en as mu
 import reporte_utils_en as ru
 try:
@@ -147,6 +151,147 @@ def _fecha_hora_informe(con_segundos=False):
     """Current date and time in the USER's timezone (not the server's), always
     with the UTC offset so it can never be ambiguous."""
     return ru.ahora_str(_zona_horaria_usuario(), con_segundos=con_segundos)
+
+
+def _datos_tabulares(X, nombres, clases):
+    """Data tab for tabular variables: summary table, distributions and correlation map."""
+    p = X.shape[1]
+    nombres = np.array([str(n) for n in nombres])
+    n_nan = int(np.isnan(X).sum())
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Samples", X.shape[0])
+    c2.metric("Variables", p)
+    c3.metric("Missing values", f"{n_nan} ({100 * n_nan / X.size:.1f} %)")
+    with np.errstate(all="ignore"):
+        resumen = pd.DataFrame({
+            "variable": nombres, "mean": np.nanmean(X, axis=0), "sd": np.nanstd(X, axis=0, ddof=1),
+            "min": np.nanmin(X, axis=0), "median": np.nanmedian(X, axis=0), "max": np.nanmax(X, axis=0),
+            "missing": np.isnan(X).sum(axis=0),
+        })
+        resumen["CV %"] = 100 * resumen["sd"] / resumen["mean"].abs().replace(0, np.nan)
+    st.markdown("**Summary per variable**")
+    st.dataframe(resumen.round(4), width='stretch', height=min(420, 38 + 35 * min(p, 10)))
+    orden = np.argsort(-np.nan_to_num(np.nanstd(X, axis=0) / np.maximum(np.abs(np.nanmean(X, axis=0)), 1e-12)))
+    k = st.slider("Variables shown in the plots", 5, int(min(60, p)), int(min(25, p)), key="tab_w_nvar") if p > 5 else p
+    sel = np.sort(orden[:k]) if p > k else np.arange(p)
+    Z = (X[:, sel] - np.nanmean(X[:, sel], axis=0)) / np.where(np.nanstd(X[:, sel], axis=0) > 0, np.nanstd(X[:, sel], axis=0), 1)
+    figb = go.Figure()
+    for j, jj in enumerate(sel):
+        figb.add_trace(go.Box(y=Z[:, j], name=nombres[jj], boxpoints="outliers", marker_size=3, showlegend=False))
+    figb.update_layout(height=420, title="Distribution of each variable (z-scores, for comparison)", yaxis_title="z-score")
+    st.plotly_chart(figb, width='stretch')
+    if len(sel) >= 3:
+        C = pd.DataFrame(X[:, sel], columns=nombres[sel]).corr().to_numpy()
+        figc = go.Figure(go.Heatmap(z=C, x=nombres[sel], y=nombres[sel], zmin=-1, zmax=1, colorscale="RdBu_r",
+                                    colorbar=dict(title="r")))
+        figc.update_layout(height=620, title="Correlation between variables (Pearson)", yaxis=dict(autorange="reversed"))
+        st.plotly_chart(figc, width='stretch')
+        st.caption("Strongly correlated variables carry redundant information; PCA/PLS handle that well, "
+                   "but it matters for interpreting which variable 'drives' a result.")
+
+
+@st.cache_data(show_spinner=False, max_entries=12, ttl=3600)
+def _prep_tabular_cacheado(X_sub, imputacion, norm_filas, transformacion, escalado):
+    P = tu.Preprocesador(imputacion, norm_filas, transformacion, escalado)
+    return P.fit_transform(X_sub), P
+
+
+def _pret_tabular():
+    """Preprocessing tab for tabular variables (metabolomics / clinical / other)."""
+    st.subheader("Preprocessing of tabular variables")
+    st.caption("Spectral corrections (derivatives, SNV, baseline...) make no sense for named variables. "
+               "Here: clean the variables, then choose imputation → row normalisation → transformation → scaling. "
+               "Scaling matters a lot: with raw values, the variable with the largest numbers dominates PCA/PLS.")
+    X, nombres = st.session_state.X, np.array([str(n) for n in st.session_state.nombres_var])
+    eje0 = np.asarray(st.session_state.numeros_onda, dtype=float)
+    p = X.shape[1]
+    with np.errstate(all="ignore"):
+        falt = np.isnan(X).mean(axis=0)
+        cte = (np.nanstd(X, axis=0) <= 1e-12) | np.isnan(np.nanstd(X, axis=0))
+    c1, c2, c3 = st.columns(3)
+    max_falt = c1.slider("Drop variables with more than … % missing", 0, 100, 50, key="pret_w_tab_falt")
+    quitar_cte = c2.checkbox("Drop constant variables", value=True, key="pret_w_tab_cte")
+    excl = c3.multiselect("Also exclude these variables", list(nombres), key="pret_w_tab_excl") if p <= 3000 else []
+    keep = (falt * 100 <= max_falt)
+    if quitar_cte:
+        keep &= ~cte
+    if excl:
+        keep &= ~np.isin(nombres, excl)
+    st.caption(f"Variables kept: {int(keep.sum())} of {p}"
+               + (f" — dropped: {int((falt * 100 > max_falt).sum())} for missing values, "
+                  f"{int((quitar_cte & cte).sum())} constant." if keep.sum() < p else "."))
+    if keep.sum() < 2:
+        st.error("At least 2 variables are needed — relax the filters above.")
+        return
+
+    o1, o2, o3, o4 = st.columns(4)
+    imp = o1.selectbox("1. Missing values", ["Median", "Mean", "Half of the minimum", "Zero"], key="pret_w_tab_imp",
+                       help="Applied per variable. 'Half of the minimum' is common in metabolomics for values "
+                            "below the detection limit.")
+    nf = o2.selectbox("2. Row normalisation", ["None", "Sum", "Median", "PQN"], key="pret_w_tab_nf",
+                      help="Corrects dilution / total-amount differences between samples (urine, plasma...). "
+                           "Leave at None for clinical variables.")
+    tr = o3.selectbox("3. Transformation", ["None", "log10", "ln", "log2", "Square root", "glog"], key="pret_w_tab_tr",
+                      help="Reduces skewness and makes variance less dependent on concentration. "
+                           "glog tolerates zeros and negatives.")
+    es = o4.selectbox("4. Scaling", ["Autoscaling", "Pareto", "Mean centering", "Range", "Level", "Robust (median/MAD)", "None"],
+                      key="pret_w_tab_es",
+                      help="Autoscaling (mean 0, sd 1) gives every variable the same weight — the usual choice for "
+                           "variables in different units. Pareto keeps part of the size information (typical in "
+                           "metabolomics / NMR). Mean centering only keeps the original scale.")
+    m_imp = {"Median": "median", "Mean": "mean", "Half of the minimum": "min2", "Zero": "zero"}[imp]
+    m_nf = {"None": "none", "Sum": "sum", "Median": "median", "PQN": "pqn"}[nf]
+    m_tr = {"None": "none", "log10": "log10", "ln": "ln", "log2": "log2", "Square root": "sqrt", "glog": "glog"}[tr]
+    m_es = {"Autoscaling": "auto", "Pareto": "pareto", "Mean centering": "center", "Range": "range",
+            "Level": "level", "Robust (median/MAD)": "robust", "None": "none"}[es]
+
+    X_sub, eje_sub = X[:, keep], eje0[keep]
+    try:
+        X_pret, P = _prep_tabular_cacheado(X_sub, m_imp, m_nf, m_tr, m_es)
+    except Exception as e:
+        st.error(f"Could not apply this combination: {e}")
+        return
+    if not np.isfinite(X_pret).all():
+        st.error("The result has non-finite values (e.g. log of a variable with all zeros). Change the transformation.")
+        return
+    desc = P.describir() or "none"
+    st.caption("Combination in the preview: " + desc)
+    propuesta = repr(("tab", m_imp, m_nf, m_tr, m_es, hash(keep.tobytes())))
+    ya = (st.session_state.get("pret_propuesta_aplicada") == propuesta)
+
+    k = min(15, X_sub.shape[1])
+    sel = np.argsort(-np.nan_to_num(np.nanstd(X_sub, axis=0) / np.maximum(np.abs(np.nanmean(X_sub, axis=0)), 1e-12)))[:k]
+    nm = nombres[keep][sel]
+    cA, cB = st.columns(2)
+    for col, M, tit in ((cA, X_sub[:, sel], "Before (raw values)"), (cB, X_pret[:, sel], "After")):
+        f = go.Figure()
+        for j in range(k):
+            f.add_trace(go.Box(y=M[:, j], name=nm[j], boxpoints=False, showlegend=False))
+        f.update_layout(title=tit + f" — {k} most variable", height=360)
+        col.plotly_chart(f, width='stretch')
+
+    if ya:
+        st.success("✅ This combination is the one currently applied to the analysis.")
+    else:
+        st.warning("⚠️ This is only a **preview**. The rest of the app is using: "
+                   f"**{st.session_state.get('pret_desc_aplicada', 'none')}**. Click **Apply** to use this one.")
+    b1, b2, _ = st.columns([1.5, 1.5, 3])
+    if b1.button("✅ Apply to the analysis", key="pret_btn_aplicar", type="secondary" if ya else "primary", disabled=ya):
+        st.session_state.X_pret = X_pret
+        st.session_state.numeros_onda_pret = eje_sub
+        st.session_state.pasos_pretratamiento = []
+        st.session_state.tab_prep = P
+        st.session_state.pret_propuesta_aplicada = propuesta
+        st.session_state.pret_desc_aplicada = desc
+        _rerun_tab()
+    if b2.button("↩ Reset (raw values)", key="pret_btn_reset"):
+        resetear_prefijo("pret_w_")
+        reiniciar_pretratamiento()
+        _rerun_tab()
+    nprev = min(40, X_pret.shape[1])
+    st.caption(f"Preview of the 'After' data: first 10 samples × first {nprev} variables.")
+    st.dataframe(pd.DataFrame(X_pret[:10, :nprev], index=st.session_state.ids[:10], columns=nombres[keep][:nprev]),
+                 width='stretch')
 
 
 def _generar_reporte(*args, **kwargs):
@@ -533,6 +678,11 @@ def _leer_preview_cacheada(bytes_archivo, nombre_archivo, hoja):
     return out
 
 
+@st.cache_data(show_spinner=False, max_entries=6, ttl=3600)
+def _alinear_cacheado(X, eje, n_int, max_d):
+    return cu.alinear_intervalos(X, eje, n_int, max_d)
+
+
 @st.cache_data(show_spinner=False, max_entries=12, ttl=3600)
 def _aplicar_pretratamiento_cacheado(X_paso0, secuencia):
     """Cached preprocessing: only recomputes when the raw data or the chosen
@@ -576,9 +726,59 @@ def _calcular_outliers_cacheado(X_pca_input, scores_completo, cargas_completo,
     return T2, T2_lim, Q, Q_lim, Q_lim_confiable
 
 
+def es_tabular():
+    return bool(st.session_state.get("_modo_tab", False)) and st.session_state.get("nombres_var") is not None
+
+
+def etiquetas_var(eje):
+    """Names for a (possibly cropped/subsetted) axis: real variable names in tabular mode,
+    the axis values as text otherwise."""
+    eje = np.asarray(eje, dtype=float)
+    if es_tabular():
+        nv = st.session_state.nombres_var
+        idx = np.clip(np.rint(eje).astype(int) - 1, 0, len(nv) - 1)
+        return np.array([str(nv[i]) for i in idx], dtype=object)
+    return np.array([f"{v:g}" for v in eje], dtype=object)
+
+
+def _con_nombres(df):
+    """Display copy of a results table with variable NAMES instead of axis positions (tabular mode)."""
+    if not es_tabular():
+        return df
+    df = df.copy()
+    if "From" in df.columns and "To" in df.columns:
+        f = etiquetas_var(df["From"].to_numpy(float)); t = etiquetas_var(df["To"].to_numpy(float))
+        df.insert(0, "Variable(s)", [a if a == b else f"{a} … {b}" for a, b in zip(f, t)])
+        df = df.drop(columns=["From", "To"])
+    for c in ("variable", "Variable", "Position"):
+        if c in df.columns:
+            df[c] = etiquetas_var(df[c].to_numpy(float))
+    return df
+
+
+def _ticks_nombres(fig, eje):
+    """Tabular mode: write the variable names on the x axis (when there are few enough)."""
+    if es_tabular():
+        eje = np.asarray(eje, dtype=float)
+        if len(eje) <= 80:
+            fig.update_xaxes(tickmode="array", tickvals=list(eje), ticktext=list(etiquetas_var(eje)), tickangle=-60)
+    return fig
+
+
+def _extras_tabular():
+    """What a saved model needs in order to score new TABULAR samples: variable names, the fitted
+    preprocessor and the axis (positions) it was trained on."""
+    if not es_tabular():
+        return {}
+    return {"nombres_var": list(st.session_state.nombres_var), "tab_prep": st.session_state.get("tab_prep"),
+            "tab_eje": np.asarray(st.session_state.numeros_onda_pret, dtype=float)}
+
+
 def df_variables_seleccionadas(eje, mascara):
-    """Table with the detail of the selected variables (wavenumbers)."""
+    """Table with the detail of the selected variables (wavenumbers, or names in tabular mode)."""
     idx_sel = np.where(mascara)[0]
+    if es_tabular():
+        return pd.DataFrame({"position": idx_sel, "variable": etiquetas_var(eje[idx_sel])})
     return pd.DataFrame({
         "position": idx_sel,
         "wavenumber": eje[idx_sel],
@@ -629,6 +829,8 @@ def init_state():
         "ids": None,
         "numeros_onda": None,
         "numeros_onda_pret": None,
+        "tab_prep": None,            # fitted tabular preprocessor (for predicting new samples)
+        "nombres_var": None,         # tabular mode: real variable names (axis is 1..p)
         "X": None,
         "clases": None,
         "mascara_excluidas": None,   # bool array: True = sample excluded as outlier
@@ -850,9 +1052,19 @@ def limpiar_resultados_exploratorios():
 def reiniciar_pretratamiento():
     """Back to the raw spectra: no preprocessing applied to the analysis."""
     st.session_state.X_pret = st.session_state.X.copy()
+    if es_tabular() and np.isnan(st.session_state.X_pret).any():
+        # the analyses cannot run with gaps: fill them with the variable median (changeable in Preprocessing)
+        st.session_state.X_pret = tu.imputar(st.session_state.X_pret, "median")
     st.session_state.numeros_onda_pret = st.session_state.numeros_onda
     st.session_state.pasos_pretratamiento = []
-    st.session_state.pret_desc_aplicada = "none (raw spectra)"
+    if es_tabular():
+        _p0 = tu.Preprocesador("median", "none", "none", "none")
+        _p0.fit_transform(st.session_state.X)
+        st.session_state.tab_prep = _p0
+    else:
+        st.session_state.tab_prep = None
+    st.session_state.pret_desc_aplicada = ("none (raw values; gaps filled with the median)"
+                                           if es_tabular() else "none (raw spectra)")
     st.session_state.pret_propuesta_aplicada = repr(((), None))   # same fingerprint as "no steps"
     st.session_state.pop("pret_descarga", None)
 
@@ -1011,10 +1223,15 @@ with st.sidebar:
                     st.error("This file doesn't look like a project saved by this app.")
                 else:
                     for k, v in proyecto_cargado.items():
+                        if k == "_modo_tab":
+                            continue
                         st.session_state[k] = v
+                    _tab_proy = bool(proyecto_cargado.get("_modo_tab", False))
+                    st.session_state["_forzar_modo"] = ("Tabular variables (metabolomics, clinical, other)"
+                                                        if _tab_proy else "Spectra / signals")
                     try:   # so the restored preprocessing isn't mistaken for "stale" data
                         _Xp = st.session_state.X
-                        st.session_state["_X_firma"] = (_Xp.shape, round(float(np.nansum(_Xp)), 6))
+                        st.session_state["_X_firma"] = (_Xp.shape, round(float(np.nansum(_Xp)), 6), _tab_proy)
                     except Exception:
                         pass
                     limpiar_resultados_exploratorios()
@@ -1055,8 +1272,22 @@ with st.sidebar:
                     st.error(_detalle)
 
     st.header("1. Load data")
+    if "_forzar_modo" in st.session_state:      # set by "Load a saved project"
+        st.session_state["modo_datos"] = st.session_state.pop("_forzar_modo")
+    _modo_datos = st.radio(
+        "Type of data",
+        ["Spectra / signals", "Tabular variables (metabolomics, clinical, other)"],
+        key="modo_datos",
+        help="Spectra / signals: each column is a point of a spectrum or chromatogram (the header is the "
+             "wavenumber, ppm, time...). Tabular variables: each column is a named variable "
+             "(a compound concentration, a clinical analysis, any measured quantity). In this mode the "
+             "spectral preprocessing is replaced by transformation / scaling suited to tabular data, "
+             "and variable NAMES are shown in the results (the axis is simply 1, 2, 3...).",
+    )
+    MODO_TAB = _modo_datos.startswith("Tabular")
+    st.session_state["_modo_tab"] = MODO_TAB
     archivo = st.file_uploader(
-        "Spectra file",
+        "Data file" if MODO_TAB else "Spectra file",
         type=["csv", "xlsx", "xls"],
         help="You can choose afterwards which row and which columns correspond to what.",
     )
@@ -1113,7 +1344,8 @@ with st.sidebar:
             _id_def = columnas[0] if (columnas and not _es_numero(columnas[0])
                                       and not pd.api.types.is_numeric_dtype(df_completo[columnas[0]])) else None
             _extra = [c for c in columnas if c != _id_def and not _es_numero(c) and not c.startswith("Unnamed")]
-            _y_def = next((c for c in _extra if pd.api.types.is_numeric_dtype(df_completo[c])), None)
+            _y_def = (None if MODO_TAB else
+                      next((c for c in _extra if pd.api.types.is_numeric_dtype(df_completo[c])), None))
             _cl_def = next((c for c in _extra if not pd.api.types.is_numeric_dtype(df_completo[c])), None)
             col1, col2 = st.columns(2)
             with col1:
@@ -1182,7 +1414,23 @@ with st.sidebar:
                 if opcion_valor_y in columnas_restantes:
                     columnas_restantes.remove(opcion_valor_y)
 
-            numeros_onda = ejes_a_float(columnas_restantes)
+            if MODO_TAB:
+                # tabular mode: keep numeric columns only; the axis is the position 1..p and the
+                # real names travel separately (nombres_var)
+                _num = [c for c in columnas_restantes if pd.api.types.is_numeric_dtype(df_completo[c])]
+                _no_num = [c for c in columnas_restantes if c not in _num]
+                if _no_num:
+                    st.warning(f"{len(_no_num)} non-numeric column(s) were left out of the variables: "
+                               + ", ".join(_no_num[:8]) + ("..." if len(_no_num) > 8 else "")
+                               + ". If one is a class, assign it above.")
+                if len(_num) < 2:
+                    raise ValueError("Tabular mode needs at least 2 numeric variable columns.")
+                columnas_restantes = _num
+                numeros_onda = np.arange(1, len(_num) + 1, dtype=float)
+                st.session_state.nombres_var = np.array(_num, dtype=object)
+            else:
+                numeros_onda = ejes_a_float(columnas_restantes)
+                st.session_state.nombres_var = None
             X = df_completo[columnas_restantes].to_numpy(dtype=float)
 
             cambio_tamano = (st.session_state.X is None) or (st.session_state.X.shape[0] != X.shape[0])
@@ -1190,7 +1438,7 @@ with st.sidebar:
                 st.session_state.get("archivo_cargado_id") is not None
                 and st.session_state.get("archivo_cargado_id") != id_archivo
             )
-            df_final = pd.DataFrame(X, index=ids, columns=numeros_onda)
+            df_final = pd.DataFrame(X, index=ids, columns=(st.session_state.nombres_var if MODO_TAB else numeros_onda))
             df_final.index.name = "id"
 
             st.session_state.df = df_final
@@ -1200,7 +1448,7 @@ with st.sidebar:
             # Different data than last time (new file, other columns/header row...)?
             # Then whatever was preprocessed/computed before no longer applies:
             # go back to raw spectra and drop the old exploratory results.
-            _firma_X = (X.shape, round(float(np.nansum(X)), 6))
+            _firma_X = (X.shape, round(float(np.nansum(X)), 6), MODO_TAB)
             if st.session_state.get("_X_firma") != _firma_X:
                 st.session_state["_X_firma"] = _firma_X
                 resetear_prefijo("pret_w_")
@@ -1337,7 +1585,7 @@ with st.sidebar:
             CLAVES_PROYECTO = [
                 "df", "ids", "numeros_onda", "X", "clases", "mascara_excluidas",
                 "X_pret", "numeros_onda_pret", "pasos_pretratamiento",
-                "valores_y", "modelos_guardados",
+                "valores_y", "modelos_guardados", "nombres_var", "tab_prep", "_modo_tab",
             ]
             if st.button("💾 Prepare project file", help="Packages everything listed above into one downloadable file."):
                 proyecto = {k: st.session_state[k] for k in CLAVES_PROYECTO if k in st.session_state}
@@ -1374,6 +1622,9 @@ _NOMBRES_TABS = [
     "🧪 Preprocessing",
     "✂️ Crop",
     "🧭 PCA",
+    "🔎 PC finder",
+    "🌲 Non-linear finder",
+    "🤝 Consensus",
     "🚩 Outliers",
     "🌳 Dendrogram",
     "🛠️ Other tools",
@@ -1527,6 +1778,9 @@ if _abierta(tabs[1]):
 
         ids, X, clases = datos_activos()
 
+        if es_tabular():
+            _datos_tabulares(X, st.session_state.nombres_var, clases)
+            return
         st.subheader("Spectra")
         fig = go.Figure()
         colores_clase = None
@@ -1562,6 +1816,9 @@ if _abierta(tabs[2]):
     # re-executing the whole app. Buttons that must refresh other parts call st.rerun().
     @st.fragment
     def _frag_tab_2():
+        if es_tabular():
+            _pret_tabular()
+            return
         st.subheader("Spectral preprocessing")
 
         # Important: preprocessing is always computed on ALL samples (not just the
@@ -1583,6 +1840,33 @@ if _abierta(tabs[2]):
         X_paso0 = X
         numeros_onda_paso0 = numeros_onda_crudo
         ancho_bucket_usado = None
+        alin_firma = None
+        if tipo_senal in ("NMR", "Chromatogram"):
+            _alinear = st.checkbox(
+                "Align peaks (correct band / peak shifts)", value=False, key="pret_w_align",
+                help="Peaks that move between samples (NMR: pH, ionic strength, temperature; chromatograms: "
+                     "retention-time drift) look like different variables to PCA/PLS. Each interval of the "
+                     "spectrum is shifted, sample by sample, to match a reference (the median spectrum) "
+                     "(icoshift-style). Centering does NOT fix this — alignment does. It is applied before "
+                     "bucketing and does not change the axis.")
+            if _alinear:
+                _rg = abs(float(numeros_onda_crudo[-1]) - float(numeros_onda_crudo[0]))
+                ca1, ca2 = st.columns(2)
+                _n_int = ca1.slider("Number of intervals", 5, 200, 40, key="pret_w_align_n",
+                                    help="More intervals = more local correction (and more risk of distorting "
+                                         "wide peaks). 30–80 is a good start.")
+                _max_d = ca2.slider("Maximum shift (axis units, e.g. ppm or min)",
+                                    min_value=float(_rg / 2000), max_value=float(_rg / 20),
+                                    value=float(_rg / 200), format="%.5f", key="pret_w_align_d",
+                                    help="Largest displacement allowed in each interval. Keep it smaller than the "
+                                         "distance between neighbouring peaks.")
+                try:
+                    X_paso0, _desp = _alinear_cacheado(X, np.asarray(numeros_onda_crudo, dtype=float), int(_n_int), round(float(_max_d), 8))
+                    alin_firma = ("align", int(_n_int), round(float(_max_d), 8))
+                    st.caption(f"Alignment applied: mean |shift| = {np.abs(_desp).mean():.2f} points, "
+                               f"max = {np.abs(_desp).max()} points (the search is capped at ±80 points).")
+                except Exception as e:
+                    st.error(f"Alignment failed: {e}")
         if tipo_senal == "NMR":
             usar_bucketing = st.checkbox(
                 "Apply bucketing (binning)", value=True, key="pret_w_bucketing",
@@ -1604,7 +1888,7 @@ if _abierta(tabs[2]):
                          "are more sensitive to small shifts between samples.",
                 )
                 try:
-                    X_paso0, numeros_onda_paso0 = cu.bucketing(X, numeros_onda_crudo, ancho_bucket)
+                    X_paso0, numeros_onda_paso0 = cu.bucketing(X_paso0, numeros_onda_crudo, ancho_bucket)
                     ancho_bucket_usado = round(float(ancho_bucket), 8)
                     st.caption(f"Bucketing applied: {X.shape[1]} variables → {X_paso0.shape[1]} buckets.")
                     if X_paso0.shape[1] > 3000:
@@ -1720,7 +2004,8 @@ if _abierta(tabs[2]):
             return (nombre, tuple(sorted(
                 (k, f"array{v.shape}" if hasattr(v, "shape") else v) for k, v in params.items())))
 
-        _propuesta = repr((tuple(_sin_arrays(p) for p in secuencia if p is not None), ancho_bucket_usado))
+        _propuesta = repr((tuple(_sin_arrays(p) for p in secuencia if p is not None),
+                           ancho_bucket_usado if alin_firma is None else (ancho_bucket_usado, alin_firma)))
         _ya_aplicada = (st.session_state.get("pret_propuesta_aplicada") == _propuesta)
 
         st.markdown("**Before / after comparison**")
@@ -1754,6 +2039,8 @@ if _abierta(tabs[2]):
         else:
             if paso_b != "None": nombres_mostrar.append(paso_b)
             if paso_a != "None": nombres_mostrar.append(paso_a)
+        if alin_firma is not None:
+            nombres_mostrar.insert(0, f"Peak alignment ({alin_firma[1]} intervals)")
         if nombres_mostrar:
             st.caption("Combination in the preview: " + " → ".join(nombres_mostrar))
         else:
@@ -1929,7 +2216,7 @@ if _abierta(tabs[4]):
                 _opc_color = ["Class" if clases is not None else "None"]
                 if _valores_pca is not None:
                     _opc_color.append("Reference value (gradient)")
-                _opc_color.append("Spectral variable (gradient)")
+                _opc_color.append("Variable (gradient)" if es_tabular() else "Spectral variable (gradient)")
                 _modo_color = st.radio("Color samples by", _opc_color, horizontal=True, key="pca_w_color",
                                        help="'Reference value' paints each sample on a colour scale according to its "
                                             "analyte concentration / reference value. 'Spectral variable' uses the "
@@ -1938,15 +2225,20 @@ if _abierta(tabs[4]):
                     _color_vals, _color_lab = _valores_pca, "Reference value"
                     if np.isnan(_valores_pca).any():
                         st.caption(f"{int(np.isnan(_valores_pca).sum())} sample(s) have no reference value and are drawn in grey.")
-                elif _modo_color.startswith("Spectral"):
+                elif _modo_color.startswith(("Spectral", "Variable")):
                     _eje_col = np.asarray(st.session_state.pca_eje, dtype=float)
                     _X_col = st.session_state.pca_X_input
-                    _v_txt = st.select_slider("Variable (wavelength / wavenumber)",
-                                              options=[float(v) for v in _eje_col],
-                                              value=float(_eje_col[len(_eje_col) // 2]), key="pca_w_color_var",
-                                              format_func=lambda v: f"{v:g}")
-                    _j = int(np.argmin(np.abs(_eje_col - _v_txt)))
-                    _color_vals, _color_lab = _X_col[:, _j], f"Signal @ {_eje_col[_j]:g}"
+                    if es_tabular():
+                        _nm_col = list(etiquetas_var(_eje_col))
+                        _j = st.selectbox("Variable", range(len(_nm_col)), format_func=lambda i: _nm_col[i], key="pca_w_color_varT")
+                        _color_vals, _color_lab = _X_col[:, _j], _nm_col[_j]
+                    else:
+                        _v_txt = st.select_slider("Variable (wavelength / wavenumber)",
+                                                  options=[float(v) for v in _eje_col],
+                                                  value=float(_eje_col[len(_eje_col) // 2]), key="pca_w_color_var",
+                                                  format_func=lambda v: f"{v:g}")
+                        _j = int(np.argmin(np.abs(_eje_col - _v_txt)))
+                        _color_vals, _color_lab = _X_col[:, _j], f"Signal @ {_eje_col[_j]:g}"
 
                 def grafico_scores(pc_x, pc_y):
                     _kw = dict(color=clases if clases is not None else None,
@@ -2019,10 +2311,477 @@ if _abierta(tabs[4]):
         _frag_tab_4()
 
 
+@st.cache_data(show_spinner=False, max_entries=6, ttl=3600)
+def _pca_pcf_cacheado(X, k):
+    return pcf.ajustar_pca(X, k)
+
+
+if _abierta(tabs[5]):
+    @st.fragment
+    def _frag_tab_14():
+        st.subheader("PC finder — which PCs carry the difference, and which variables explain it")
+        st.caption(
+            "A quick exploratory shortcut. **Classification:** finds the PCs (alone, in pairs or in triples) where the "
+            "classes are most separated. **Regression:** finds the PCs where the reference values (e.g. concentration) "
+            "change along a clear direction. The informative PCs are often NOT the first ones — they can be partly "
+            "hidden behind larger sources of variation. The chosen combination is then traced back to the original "
+            "variables, so you can see which part of the spectrum / chromatogram (ppm, wavenumber, retention time) "
+            "separates the groups or follows the concentration: candidate functional groups, compounds or markers.")
+
+        ids_a, _, clases_a = datos_activos()
+        X_in = st.session_state.X_pret[indice_activo()]
+        X_in, eje_in, _m_pcf, _ = elegir_espectro_modelado(
+            X_in, np.array(st.session_state.numeros_onda_pret, dtype=float), "pcf")
+        eje_in = np.asarray(eje_in, dtype=float)
+
+        valores_a = None
+        if st.session_state.get("valores_y") is not None:
+            _mapa = dict(zip(map(str, st.session_state.ids), st.session_state.valores_y))
+            valores_a = np.array([_mapa.get(str(i), np.nan) for i in ids_a], dtype=float)
+
+        tareas = []
+        if clases_a is not None:
+            _cnt = pd.Series(clases_a).value_counts()
+            if len(_cnt) >= 2 and _cnt.min() >= 2:
+                tareas.append("Classification")
+        if valores_a is not None and np.isfinite(valores_a).sum() >= 8:
+            tareas.append("Regression")
+        if X_in.shape[0] < 6 or not tareas:
+            st.info("Load classes (≥ 2 classes with ≥ 2 samples each) or reference values (≥ 8 samples) in the "
+                    "left-hand panel to use this tab.")
+            return
+
+        tarea = st.radio("What do you want to find?", tareas, horizontal=True, key="pcf_w_tarea")
+        if tarea == "Regression":
+            _ok = np.isfinite(valores_a)
+            X_f, y_f, ids_f, cl_f = X_in[_ok], valores_a[_ok], ids_a[_ok], None
+        else:
+            X_f, y_f, ids_f, cl_f = X_in, None, ids_a, np.asarray(clases_a)
+
+        c1, c2 = st.columns(2)
+        k_tope = int(max(3, min(15, X_f.shape[0] - 1)))
+        k_max = c1.slider("PCs to explore", 3, k_tope, min(8, k_tope), key="pcf_w_k",
+                          help="Only the first N principal components are searched.")
+        tam = c2.radio("Combination size", [1, 2, 3], index=1, horizontal=True, key="pcf_w_tam",
+                       format_func=lambda v: {1: "1 PC", 2: "2 PCs", 3: "3 PCs"}[v],
+                       help="2 PCs gives a plot you can read directly; 3 PCs finds more but is harder to see.")
+
+        with st.spinner("Searching..."):
+            scores, cargas, var_exp = _pca_pcf_cacheado(X_f, k_tope)
+            if tarea == "Classification":
+                rank = pcf.buscar_clasificacion(scores, cl_f, k_max, tam)
+                col_crit, col_cv = "Separation (1-Wilks)", "CV balanced accuracy"
+            else:
+                rank = pcf.buscar_regresion(scores, y_f, k_max, tam)
+                col_crit, col_cv = "Adjusted R²", "Q² (CV)"
+
+        st.markdown(f"**Best combinations of {tam} PC{'s' if tam > 1 else ''}**")
+        tabla = rank.head(10)[["PCs", col_crit, col_cv]].copy()
+        tabla.insert(1, "Explained variance (PCA)", [
+            f"{sum(var_exp[j] for j in c):.1f}%" for c in rank.head(10)["cols"]])
+        st.dataframe(tabla.round(3), width="stretch", hide_index=True)
+        if tarea == "Classification":
+            st.caption("**Separation** = share of the variance in those PCs that lies between classes (0–1). The "
+                       "cross-validated accuracy confirms the top candidates with a simple LDA on those PCs only. "
+                       "Always compare combinations of the same size.")
+        else:
+            st.caption("**Adjusted R²** = how well those PCs explain the reference values (linear fit); **Q²** is the "
+                       "cross-validated version (closer to R² = more trustworthy).")
+
+        opciones = [f"{r.PCs}  ·  {r[col_crit]:.3f}" for _, r in rank.head(10).iterrows()]
+        elegido = st.selectbox("Combination to inspect", opciones, index=0, key="pcf_w_sel")
+        fila = rank.iloc[opciones.index(elegido)]
+        cols = list(fila["cols"])
+        etiq = [f"PC{j + 1} ({var_exp[j]:.1f}%)" for j in cols]
+        S = scores[:, cols]
+
+        # ---- scores plot of the chosen combination
+        if tarea == "Classification":
+            if tam == 1:
+                fig = px.box(x=cl_f, y=S[:, 0], points="all", color=cl_f, color_discrete_sequence=CLASS_PALETTE,
+                             hover_name=ids_f, labels={"x": "Class", "y": etiq[0], "color": "Class"})
+            elif tam == 2:
+                fig = px.scatter(x=S[:, 0], y=S[:, 1], color=cl_f, color_discrete_sequence=CLASS_PALETTE,
+                                 hover_name=ids_f, labels={"x": etiq[0], "y": etiq[1], "color": "Class"})
+                fig.add_hline(y=0, line_color="lightgray"); fig.add_vline(x=0, line_color="lightgray")
+            else:
+                fig = px.scatter_3d(x=S[:, 0], y=S[:, 1], z=S[:, 2], color=cl_f, color_discrete_sequence=CLASS_PALETTE,
+                                    hover_name=ids_f, labels={"x": etiq[0], "y": etiq[1], "z": etiq[2], "color": "Class"})
+        else:
+            if tam == 1:
+                fig = px.scatter(x=S[:, 0], y=y_f, color=y_f, color_continuous_scale="Viridis", hover_name=ids_f,
+                                 labels={"x": etiq[0], "y": "Reference value", "color": "Reference value"})
+            elif tam == 2:
+                fig = px.scatter(x=S[:, 0], y=S[:, 1], color=y_f, color_continuous_scale="Viridis", hover_name=ids_f,
+                                 labels={"x": etiq[0], "y": etiq[1], "color": "Reference value"})
+                fig.add_hline(y=0, line_color="lightgray"); fig.add_vline(x=0, line_color="lightgray")
+                _A = np.column_stack([np.ones(len(y_f)), S])
+                _b = np.linalg.lstsq(_A, y_f, rcond=None)[0][1:]
+                _u = _b / (np.linalg.norm(_b) or 1.0)
+                _L = 0.45 * min(np.ptp(S[:, 0]), np.ptp(S[:, 1]))
+                _c = S.mean(axis=0)
+                fig.add_annotation(x=_c[0] + _u[0] * _L, y=_c[1] + _u[1] * _L, ax=_c[0] - _u[0] * _L, ay=_c[1] - _u[1] * _L,
+                                   xref="x", yref="y", axref="x", ayref="y", showarrow=True, arrowhead=3,
+                                   arrowwidth=3, arrowcolor="crimson")
+                st.caption("The red arrow marks the direction in which the reference value increases.")
+            else:
+                fig = px.scatter_3d(x=S[:, 0], y=S[:, 1], z=S[:, 2], color=y_f, color_continuous_scale="Viridis",
+                                    hover_name=ids_f, labels={"x": etiq[0], "y": etiq[1], "z": etiq[2], "color": "Reference value"})
+        fig.update_layout(height=480, title="Samples in the chosen PCs")
+        st.plotly_chart(fig, width="stretch")
+
+        # ---- back to the variables
+        st.markdown("### Which variables explain it?")
+        imp, signed = pcf.direccion_variables(scores, cargas, cols, clases=cl_f, y=y_f)
+        cc1, cc2 = st.columns(2)
+        pct = cc1.slider("Highlight the top % of variables", 1, 20, 5, key="pcf_w_pct",
+                         help="Contiguous variables in the top % of importance are grouped into regions.")
+        modo_v = cc2.radio("Curve", ["Importance"] + (["Signed direction"] if signed is not None else []),
+                           horizontal=True, key="pcf_w_curva",
+                           help="Importance (0–1) shows WHERE the difference is. The signed direction also shows "
+                                "which way: positive = higher in the second class / higher with concentration.")
+        curva = imp if modo_v == "Importance" else signed
+        regiones, umbral = pcf.regiones_importantes(eje_in, imp, percentil=100 - pct)
+        picos = pcf.picos_importantes(eje_in, imp, signed)
+
+        from plotly.subplots import make_subplots
+        figv = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.4, 0.6], vertical_spacing=0.04)
+        figv.add_trace(_traza_espectro(eje_in, X_f.mean(axis=0).round(6), mode="lines", name="Mean spectrum",
+                                       line=dict(color="#5F5E5A", width=1)), row=1, col=1)
+        figv.add_trace(_traza_espectro(eje_in, curva, mode="lines", name=modo_v,
+                                       line=dict(color="#0F6E56", width=1.3)), row=2, col=1)
+        for _, r in regiones.iterrows():
+            figv.add_vrect(x0=min(r["From"], r["To"]), x1=max(r["From"], r["To"]), fillcolor="crimson",
+                           opacity=0.18, line_width=0)
+        figv.update_layout(height=520, showlegend=False,
+                           title=f"Mean spectrum (top) and variable {modo_v.lower()} (bottom) for {etiq and ' + '.join(f'PC{j+1}' for j in cols)}")
+        figv.update_yaxes(title_text="Signal", row=1, col=1)
+        figv.update_yaxes(title_text=modo_v, row=2, col=1)
+        figv.update_xaxes(title_text=("Variable" if es_tabular() else "Variable (wavenumber / ppm / time)"), row=2, col=1)
+        if eje_in[0] > eje_in[-1]:
+            figv.update_xaxes(autorange="reversed")
+        _ticks_nombres(figv, eje_in)
+        st.plotly_chart(figv, width="stretch")
+        st.caption("Red bands = regions in the top "
+                   f"{pct}% of importance. Check them against your reference table (chemical shifts, functional-group "
+                   "bands, retention times) to name the compounds.")
+
+        t1, t2 = st.columns(2)
+        t1.markdown("**Regions**")
+        t1.dataframe(_con_nombres(regiones).round(4), width="stretch", hide_index=True)
+        t2.markdown("**Strongest single peaks**")
+        t2.dataframe(_con_nombres(picos).round(4), width="stretch", hide_index=True)
+
+        with st.expander("📈 Loadings of the chosen PCs"):
+            figl = go.Figure()
+            for j in cols:
+                figl.add_trace(_traza_espectro(eje_in, cargas[j], mode="lines", name=f"PC{j + 1}", line=dict(width=1.2)))
+            figl.update_layout(height=380, xaxis_title="Variable", yaxis_title="Loading")
+            if eje_in[0] > eje_in[-1]:
+                figl.update_xaxes(autorange="reversed")
+            _ticks_nombres(figl, eje_in)
+            st.plotly_chart(figl, width="stretch")
+
+        _vars_df = pd.DataFrame({"variable": (etiquetas_var(eje_in) if es_tabular() else eje_in), "importance": imp})
+        if signed is not None:
+            _vars_df["signed_direction"] = signed
+        st.download_button(
+            "⬇️ Download results (Excel)",
+            data=df_a_excel_bytes({"ranking": rank.drop(columns=["cols"]), "regions": regiones,
+                                   "peaks": picos, "variable_importance": _vars_df}),
+            file_name="pc_finder_results.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="pcf_dl")
+    with tabs[5]:
+        _frag_tab_14()
+
+
+def _preparar_finder(prefijo):
+    """Common input for the finder tabs: active samples, preprocessed spectra (full / cropped),
+    task (classification / regression) and the matching targets. Returns None if not possible."""
+    ids_a, _, clases_a = datos_activos()
+    X_in = st.session_state.X_pret[indice_activo()]
+    X_in, eje_in, _m, _ = elegir_espectro_modelado(
+        X_in, np.array(st.session_state.numeros_onda_pret, dtype=float), prefijo)
+    eje_in = np.asarray(eje_in, dtype=float)
+    valores_a = None
+    if st.session_state.get("valores_y") is not None:
+        _mapa = dict(zip(map(str, st.session_state.ids), st.session_state.valores_y))
+        valores_a = np.array([_mapa.get(str(i), np.nan) for i in ids_a], dtype=float)
+    tareas = []
+    if clases_a is not None:
+        _cnt = pd.Series(clases_a).value_counts()
+        if len(_cnt) >= 2 and _cnt.min() >= 3:
+            tareas.append("Classification")
+    if valores_a is not None and np.isfinite(valores_a).sum() >= 10:
+        tareas.append("Regression")
+    if X_in.shape[0] < 8 or not tareas:
+        st.info("Load classes (≥ 2 classes with ≥ 3 samples each) or reference values (≥ 10 samples) in the "
+                "left-hand panel to use this tab.")
+        return None
+    tarea = st.radio("What do you want to find?", tareas, horizontal=True, key=f"{prefijo}_w_tarea")
+    if tarea == "Regression":
+        ok = np.isfinite(valores_a)
+        return dict(tarea=tarea, es_clf=False, X=X_in[ok], y=valores_a[ok], ids=ids_a[ok], eje=eje_in)
+    return dict(tarea=tarea, es_clf=True, X=X_in, y=np.asarray(clases_a), ids=ids_a, eje=eje_in)
+
+
+@st.cache_data(show_spinner=False, max_entries=6, ttl=3600)
+def _nl_cacheado(X, y, es_clf, n_vent):
+    wins = nlf.ventanas(X.shape[1], n_vent)
+    imp_w, imp_v, err = nlf.permutacion_ventanas(X, y, es_clf, wins, n_est=150, n_rep=2, n_jobs=mu.N_JOBS)
+    mi = nlf.mi_ventanas(X, y, es_clf, wins)
+    return imp_w, imp_v, err, mi
+
+
+@st.cache_data(show_spinner=False, max_entries=6, ttl=3600)
+def _modelos_lineal_vs_nl(X, y, es_clf):
+    from sklearn.base import clone
+    from sklearn.model_selection import KFold, StratifiedKFold, cross_val_predict
+    from sklearn.metrics import balanced_accuracy_score, r2_score
+    cat = mu.crear_clasificadores() if es_clf else mu.crear_regresores()
+    nombres = [("PLS-DA" if es_clf else "PLS", "linear"), ("Random Forest", "non-linear"),
+               ("SVM" if es_clf else "SVM (SVR)", "non-linear")]
+    if es_clf:
+        cv = StratifiedKFold(n_splits=int(min(5, pd.Series(y).value_counts().min())), shuffle=True, random_state=0)
+    else:
+        cv = KFold(n_splits=5, shuffle=True, random_state=0)
+    filas = []
+    for nom, tipo in nombres:
+        try:
+            pred = cross_val_predict(clone(cat[nom]), X, y, cv=cv, n_jobs=mu.N_JOBS)
+            m = balanced_accuracy_score(y, pred) if es_clf else r2_score(y, pred)
+        except Exception:
+            m = np.nan
+        filas.append({"Model": nom, "Type": tipo, "CV balanced accuracy" if es_clf else "CV Q²": round(float(m), 3)})
+    return pd.DataFrame(filas)
+
+
+def _cv_con_variables(X, y, es_clf, mascara):
+    from sklearn.base import clone
+    from sklearn.model_selection import KFold, StratifiedKFold, cross_val_predict
+    from sklearn.metrics import balanced_accuracy_score, r2_score
+    cat = mu.crear_clasificadores() if es_clf else mu.crear_regresores()
+    est = clone(cat["PLS-DA" if es_clf else "PLS"])
+    if es_clf:
+        cv = StratifiedKFold(n_splits=int(min(5, pd.Series(y).value_counts().min())), shuffle=True, random_state=0)
+    else:
+        cv = KFold(n_splits=5, shuffle=True, random_state=0)
+    Xs = X[:, mascara]
+    if hasattr(est, "n_components"):
+        est.set_params(n_components=int(max(1, min(5, Xs.shape[1], Xs.shape[0] - 2))))
+    pred = cross_val_predict(est, Xs, y, cv=cv)
+    return float(balanced_accuracy_score(y, pred) if es_clf else r2_score(y, pred))
+
+
+if _abierta(tabs[6]):
+    @st.fragment
+    def _frag_tab_15():
+        st.subheader("Non-linear finder — which regions matter when the relationship is not a straight line")
+        st.caption(
+            "The PC finder looks for straight-line (linear) structure in PCs. This tab works directly on the "
+            "variables with a Random Forest, so it can catch curved relationships, thresholds and interactions "
+            "between regions. Importance is measured per **window** of neighbouring variables (they are strongly "
+            "correlated, so single variables are unreliable): a window matters if scrambling it, on samples the "
+            "model has NOT seen, makes the predictions clearly worse.")
+        d = _preparar_finder("nlf")
+        if d is None:
+            return
+        c1, c2 = st.columns(2)
+        if es_tabular():
+            n_vent = int(d["X"].shape[1])
+            c1.caption(f"Tabular variables: each variable is its own 'window' ({n_vent})."
+                       + (" ⚠️ With many variables this can be slow." if n_vent > 300 else ""))
+        else:
+            n_vent = c1.slider("Number of windows", 20, 150, 60, step=10, key="nlf_w_vent",
+                               help="The axis is cut into this many equal windows. More windows = finer resolution but "
+                                    "noisier and slower.")
+        top_n = c2.slider("Windows to highlight", 1, 15, 5, key="nlf_w_top")
+        sig = (d["tarea"], d["X"].shape, float(np.nansum(d["X"][:, ::97])), n_vent)
+        if st.button("▶ Run non-linear search", type="primary", key="nlf_btn"):
+            with st.spinner("Training a Random Forest and permuting windows on held-out samples..."):
+                _nl_cacheado(d["X"], d["y"], d["es_clf"], n_vent)
+                _modelos_lineal_vs_nl(d["X"], d["y"], d["es_clf"])
+            st.session_state["nlf_sig"] = sig
+        if st.session_state.get("nlf_sig") != sig:
+            st.info("Click **Run non-linear search** (takes a few seconds to about half a minute).")
+            return
+        imp_w, imp_v, err, mi = _nl_cacheado(d["X"], d["y"], d["es_clf"], n_vent)
+        wins = nlf.ventanas(d["X"].shape[1], n_vent)
+        eje = d["eje"]
+
+        st.markdown("**Does non-linearity help for this dataset?**")
+        comp = _modelos_lineal_vs_nl(d["X"], d["y"], d["es_clf"])
+        st.dataframe(comp, width="stretch", hide_index=True)
+        st.caption("Cross-validated performance on all variables. If the non-linear models are clearly better than "
+                   "the linear one, curved relationships or interactions are likely present; if not, the linear "
+                   "PC finder already tells most of the story.")
+
+        orden = np.argsort(imp_w)[::-1][:top_n]
+        figv = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.3, 0.35, 0.35], vertical_spacing=0.04)
+        figv.add_trace(_traza_espectro(eje, d["X"].mean(axis=0).round(6), mode="lines", line=dict(color="#5F5E5A", width=1)), row=1, col=1)
+        figv.add_trace(_traza_espectro(eje, imp_v, mode="lines", line=dict(color="#7B3FA0", width=1.1)), row=2, col=1)
+        centros = [float(eje[w].mean()) for w in wins]
+        anchos = [abs(float(eje[w[-1]] - eje[w[0]])) or 1.0 for w in wins]
+        figv.add_trace(go.Bar(x=centros, y=imp_w, width=anchos, marker_color="#0F6E56", name="Permutation importance"), row=3, col=1)
+        figv.add_trace(go.Scatter(x=centros, y=mi, mode="lines+markers", line=dict(color="#C07A00", width=1),
+                                  marker=dict(size=4), name="Mutual information"), row=3, col=1)
+        for k in orden:
+            w = wins[k]
+            figv.add_vrect(x0=float(min(eje[w[0]], eje[w[-1]])), x1=float(max(eje[w[0]], eje[w[-1]])),
+                           fillcolor="crimson", opacity=0.18, line_width=0)
+        figv.update_layout(height=640, showlegend=True, legend=dict(orientation="h", y=-0.12),
+                           title="Mean spectrum · Random Forest importance per variable · importance per window")
+        figv.update_yaxes(title_text="Signal", row=1, col=1)
+        figv.update_yaxes(title_text="RF impurity", row=2, col=1)
+        figv.update_yaxes(title_text="Per window (0–1)", row=3, col=1)
+        figv.update_xaxes(title_text=("Variable" if es_tabular() else "Variable (wavenumber / ppm / time)"), row=3, col=1)
+        if eje[0] > eje[-1]:
+            figv.update_xaxes(autorange="reversed")
+        _ticks_nombres(figv, eje)
+        st.plotly_chart(figv, width="stretch")
+        st.caption("Green bars: how much the held-out predictions get worse when that window is scrambled "
+                   "(non-linear, multivariate). Orange: mutual information of the window's mean signal with the "
+                   "class / value (non-linear, one window at a time). Purple: classic Random Forest importance of "
+                   "each single variable (fine detail, but biased towards correlated variables).")
+
+        tabla = pd.DataFrame({"From": [float(eje[wins[k][0]]) for k in orden], "To": [float(eje[wins[k][-1]]) for k in orden],
+                              "Permutation importance": imp_w[orden], "Mutual information": mi[orden]}).round(3)
+        st.markdown("**Top windows**")
+        st.dataframe(_con_nombres(tabla), width="stretch", hide_index=True)
+        todo = _con_nombres(pd.DataFrame({"From": [float(eje[w[0]]) for w in wins], "To": [float(eje[w[-1]]) for w in wins],
+                             "permutation_importance": imp_w, "mutual_information": mi}))
+        st.download_button("⬇️ Download results (Excel)",
+                           data=df_a_excel_bytes({"windows": todo, "model_comparison": comp,
+                                                  "variable_importance": pd.DataFrame({"variable": (etiquetas_var(eje) if es_tabular() else eje), "rf_importance": imp_v})}),
+                           file_name="nonlinear_finder_results.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="nlf_dl")
+    with tabs[6]:
+        _frag_tab_15()
+
+
+if _abierta(tabs[7]):
+    @st.fragment
+    def _frag_tab_16():
+        st.subheader("Consensus — do two independent approaches agree?")
+        st.caption(
+            "Runs the **linear** approach (best PC combination from the PC finder, traced back to the variables) and "
+            "the **non-linear** one (Random Forest, grouped permutation) completely independently, then compares "
+            "them window by window. Regions found by BOTH are the most trustworthy candidates. Regions found by only "
+            "one are informative too: linear-only often means a smooth/collinear effect, non-linear-only suggests "
+            "curved relationships or interactions.")
+        d = _preparar_finder("cons")
+        if d is None:
+            return
+        c1, c2, c3 = st.columns(3)
+        if es_tabular():
+            n_vent = int(d["X"].shape[1])
+            c1.caption(f"Tabular variables: each variable is its own 'window' ({n_vent})."
+                       + (" ⚠️ With many variables this can be slow." if n_vent > 300 else ""))
+        else:
+            n_vent = c1.slider("Number of windows", 20, 150, 60, step=10, key="cons_w_vent")
+        tam = c2.radio("PCs per combination (linear side)", [1, 2, 3], index=1, horizontal=True, key="cons_w_tam")
+        frac = c3.slider("'Top' = best X % of windows", 5, 40, 20, key="cons_w_frac") / 100
+        sig = (d["tarea"], d["X"].shape, float(np.nansum(d["X"][:, ::97])), n_vent, tam, frac)
+        if st.button("▶ Run both approaches", type="primary", key="cons_btn"):
+            with st.spinner("Running the linear and the non-linear search..."):
+                _nl_cacheado(d["X"], d["y"], d["es_clf"], n_vent)
+            st.session_state["cons_sig"] = sig
+        if st.session_state.get("cons_sig") != sig:
+            st.info("Click **Run both approaches**.")
+            return
+        X, y, eje = d["X"], d["y"], d["eje"]
+        wins = nlf.ventanas(X.shape[1], n_vent)
+        # linear side
+        k_tope = int(max(3, min(12, X.shape[0] - 1)))
+        scores, cargas, var_exp = _pca_pcf_cacheado(X, k_tope)
+        if d["es_clf"]:
+            rank = pcf.buscar_clasificacion(scores, y, k_tope, tam)
+            imp_lin, _ = pcf.direccion_variables(scores, cargas, rank.loc[0, "cols"], clases=y)
+        else:
+            rank = pcf.buscar_regresion(scores, y, k_tope, tam)
+            imp_lin, _ = pcf.direccion_variables(scores, cargas, rank.loc[0, "cols"], y=y)
+        lin_w = nlf.a_ventanas(imp_lin, wins)
+        # non-linear side
+        imp_nl_w, imp_nl_v, _, _mi = _nl_cacheado(X, y, d["es_clf"], n_vent)
+        tabla, res = nlf.comparar_ventanas(eje, wins, lin_w, imp_nl_w, top_frac=frac)
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Best PCs (linear side)", rank.loc[0, "PCs"])
+        m2.metric("Rank agreement (Spearman)", f"{res['spearman']:.2f}" if res["spearman"] == res["spearman"] else "n/a",
+                  help="Correlation of the window rankings of the two methods (1 = identical).")
+        m3.metric(f"Overlap of top {res['k']} windows", f"{res['overlap'] * 100:.0f}%",
+                  help="Share of windows that are in the top list of BOTH methods.")
+
+        centros = [float(eje[w].mean()) for w in wins]
+        anchos = [abs(float(eje[w[-1]] - eje[w[0]])) or 1.0 for w in wins]
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.3, 0.7], vertical_spacing=0.04)
+        fig.add_trace(_traza_espectro(eje, X.mean(axis=0).round(6), mode="lines", line=dict(color="#5F5E5A", width=1)), row=1, col=1)
+        fig.add_trace(go.Bar(x=centros, y=lin_w / (lin_w.max() or 1), width=anchos, name="Linear (PC direction)",
+                             marker_color="rgba(31,119,180,0.65)"), row=2, col=1)
+        fig.add_trace(go.Bar(x=centros, y=imp_nl_w, width=anchos, name="Non-linear (Random Forest)",
+                             marker_color="rgba(214,95,0,0.65)"), row=2, col=1)
+        colores = {"Both": "seagreen", "Linear only": "royalblue", "Non-linear only": "darkorange"}
+        for _, r in tabla[tabla["Found by"] != ""].iterrows():
+            fig.add_vrect(x0=min(r["From"], r["To"]), x1=max(r["From"], r["To"]), fillcolor=colores[r["Found by"]],
+                          opacity=0.16, line_width=0)
+        fig.update_layout(height=560, barmode="overlay", legend=dict(orientation="h", y=-0.12),
+                          title="Importance per window — green band = found by both approaches")
+        fig.update_yaxes(title_text="Signal", row=1, col=1); fig.update_yaxes(title_text="Importance (0–1)", row=2, col=1)
+        fig.update_xaxes(title_text=("Variable" if es_tabular() else "Variable (wavenumber / ppm / time)"), row=2, col=1)
+        if eje[0] > eje[-1]:
+            fig.update_xaxes(autorange="reversed")
+        _ticks_nombres(fig, eje)
+        st.plotly_chart(fig, width="stretch")
+
+        vistas = tabla[tabla["Found by"] != ""].sort_values("Consensus (rank mean)", ascending=False)
+        st.markdown("**Windows in the top list of at least one method**")
+        st.dataframe(_con_nombres(vistas.drop(columns=["_i"])).round(3), width="stretch", hide_index=True)
+        n_both = int((tabla["Found by"] == "Both").sum())
+        if n_both:
+            st.success(f"{n_both} window(s) found by BOTH independent approaches — the most reliable regions.")
+        else:
+            st.warning("No window is in the top list of both methods. Try more windows / a larger 'top' share, a "
+                       "different PC combination size, or check that the classes / values really are structured.")
+
+        # independent confirmation: does a model using only those regions keep its performance?
+        st.markdown("**Confirmation: how well do the regions predict on their own?** (cross-validated PLS)")
+        etq = "balanced accuracy" if d["es_clf"] else "Q²"
+        filas = []
+        todos = np.ones(X.shape[1], dtype=bool)
+        filas.append({"Variables used": "All variables", "n variables": int(todos.sum()), etq: round(_cv_con_variables(X, y, d["es_clf"], todos), 3)})
+        for etiqueta, cat in [("Found by both", "Both"), ("Linear side top windows", None), ("Non-linear side top windows", "nl")]:
+            if cat == "Both":
+                idx = [w for i, w in enumerate(wins) if tabla.loc[i, "Found by"] == "Both"]
+            elif cat is None:
+                idx = [wins[i] for i in np.argsort(lin_w)[::-1][:res["k"]]]
+            else:
+                idx = [wins[i] for i in np.argsort(imp_nl_w)[::-1][:res["k"]]]
+            if not idx:
+                continue
+            m = np.zeros(X.shape[1], dtype=bool); m[np.concatenate(idx)] = True
+            filas.append({"Variables used": etiqueta, "n variables": int(m.sum()), etq: round(_cv_con_variables(X, y, d["es_clf"], m), 3)})
+        rng = np.random.RandomState(0)
+        aleat = []
+        for _ in range(5):
+            sel = rng.choice(len(wins), size=res["k"], replace=False)
+            m = np.zeros(X.shape[1], dtype=bool); m[np.concatenate([wins[i] for i in sel])] = True
+            aleat.append(_cv_con_variables(X, y, d["es_clf"], m))
+        filas.append({"Variables used": f"Random {res['k']} windows (mean of 5)", "n variables": "–", etq: round(float(np.mean(aleat)), 3)})
+        st.dataframe(pd.DataFrame(filas), width="stretch", hide_index=True)
+        st.caption("If the regions found by the two approaches predict about as well as all the variables and "
+                   "clearly better than random windows, they carry the relevant information.")
+        st.download_button("⬇️ Download consensus table (Excel)",
+                           data=df_a_excel_bytes({"windows": _con_nombres(tabla.drop(columns=["_i"])), "confirmation": pd.DataFrame(filas)}),
+                           file_name="consensus_results.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="cons_dl")
+    with tabs[7]:
+        _frag_tab_16()
+
+
 # -----------------------------------------------------------------------
 # TAB: OUTLIERS
 # -----------------------------------------------------------------------
-if _abierta(tabs[5]):
+if _abierta(tabs[8]):
     # Each tab re-runs ON ITS OWN when one of its widgets changes (fragment), instead of
     # re-executing the whole app. Buttons that must refresh other parts call st.rerun().
     @st.fragment
@@ -2147,21 +2906,26 @@ if _abierta(tabs[5]):
                 _X_o = st.session_state.get("pca_X_input")
                 _spec_ok_o = _eje_o is not None and _X_o is not None and len(_X_o) == len(ids)
                 if _spec_ok_o:
-                    _opc_o.append("Spectral variable (gradient)")
+                    _opc_o.append("Variable (gradient)" if es_tabular() else "Spectral variable (gradient)")
                 _modo_o = st.radio("Color samples by", _opc_o, horizontal=True, key="out_w_color",
                                    help="Paint each sample by its class, by its analyte concentration / reference "
                                         "value (colour gradient), or by the signal at one wavelength / variable — "
                                         "useful to see at a glance whether the outliers share a concentration or class.")
                 if _modo_o.startswith("Reference"):
                     _col_vals_o, _col_lab_o = _vals_o, "Reference value"
-                elif _modo_o.startswith("Spectral"):
+                elif _modo_o.startswith(("Spectral", "Variable")):
                     _eje_oo = np.asarray(_eje_o, dtype=float)
-                    _v_o = st.select_slider("Variable (wavelength / wavenumber)",
-                                            options=[float(v) for v in _eje_oo],
-                                            value=float(_eje_oo[len(_eje_oo) // 2]), key="out_w_color_var",
-                                            format_func=lambda v: f"{v:g}")
-                    _jo = int(np.argmin(np.abs(_eje_oo - _v_o)))
-                    _col_vals_o, _col_lab_o = np.asarray(_X_o)[:, _jo], f"Signal @ {_eje_oo[_jo]:g}"
+                    if es_tabular():
+                        _nm_o = list(etiquetas_var(_eje_oo))
+                        _jo = st.selectbox("Variable", range(len(_nm_o)), format_func=lambda i: _nm_o[i], key="out_w_color_varT")
+                        _col_vals_o, _col_lab_o = np.asarray(_X_o)[:, _jo], _nm_o[_jo]
+                    else:
+                        _v_o = st.select_slider("Variable (wavelength / wavenumber)",
+                                                options=[float(v) for v in _eje_oo],
+                                                value=float(_eje_oo[len(_eje_oo) // 2]), key="out_w_color_var",
+                                                format_func=lambda v: f"{v:g}")
+                        _jo = int(np.argmin(np.abs(_eje_oo - _v_o)))
+                        _col_vals_o, _col_lab_o = np.asarray(_X_o)[:, _jo], f"Signal @ {_eje_oo[_jo]:g}"
 
                 if _col_vals_o is not None:
                     fig = px.scatter(x=T2, y=Q, hover_name=ids, color=_col_vals_o, color_continuous_scale="Viridis",
@@ -2310,14 +3074,14 @@ if _abierta(tabs[5]):
                         file_name="exploratory_analysis_report.pdf", mime="application/pdf",
                         key="descargar_reporte_exp",
                     )
-    with tabs[5]:
+    with tabs[8]:
         _frag_tab_5()
 
 
 # -----------------------------------------------------------------------
 # TAB: DENDROGRAM
 # -----------------------------------------------------------------------
-if _abierta(tabs[6]):
+if _abierta(tabs[9]):
     # Each tab re-runs ON ITS OWN when one of its widgets changes (fragment), instead of
     # re-executing the whole app. Buttons that must refresh other parts call st.rerun().
     @st.fragment
@@ -2422,14 +3186,14 @@ if _abierta(tabs[6]):
                             plt.close(fig_mpl)
                         res["figuras"]["circular"] = _buf.getvalue()
                     st.image(res["figuras"]["circular"])
-    with tabs[6]:
+    with tabs[9]:
         _frag_tab_6()
 
 
 # -----------------------------------------------------------------------
 # TAB: OTHER TOOLS
 # -----------------------------------------------------------------------
-if _abierta(tabs[7]):
+if _abierta(tabs[10]):
     # Each tab re-runs ON ITS OWN when one of its widgets changes (fragment), instead of
     # re-executing the whole app. Buttons that must refresh other parts call st.rerun().
     @st.fragment
@@ -2481,8 +3245,13 @@ if _abierta(tabs[7]):
                                         "compare which wavenumbers drive each one.")
                 fig = go.Figure()
                 for i in range(n_pcs):
-                    fig.add_trace(go.Scatter(x=eje, y=cargas[i], mode="lines", name=f"PC{i+1}"))
-                fig.update_layout(height=450, xaxis_title="Wavenumber", yaxis_title="Loading")
+                    if es_tabular():
+                        fig.add_trace(go.Scatter(x=eje, y=cargas[i], mode="lines+markers", name=f"PC{i+1}",
+                                                 text=etiquetas_var(eje), hovertemplate="%{text}<br>loading %{y:.3f}<extra>PC" + str(i + 1) + "</extra>"))
+                    else:
+                        fig.add_trace(go.Scatter(x=eje, y=cargas[i], mode="lines", name=f"PC{i+1}"))
+                fig.update_layout(height=450, xaxis_title=("Variable (index; hover for the name)" if es_tabular() else "Wavenumber"),
+                                  yaxis_title="Loading")
                 if eje[0] > eje[-1]:
                     fig.update_xaxes(autorange="reversed")
                 st.plotly_chart(fig, width='stretch')
@@ -2509,11 +3278,12 @@ if _abierta(tabs[7]):
                 orden = orden[np.argsort(cargas[idx_pc, orden])]
                 colores = ["crimson" if v < 0 else "steelblue" for v in cargas[idx_pc, orden]]
                 fig = go.Figure(go.Bar(
-                    x=cargas[idx_pc, orden], y=[f"{eje[i]:.0f}" for i in orden],
+                    x=cargas[idx_pc, orden],
+                    y=(list(etiquetas_var(eje[orden])) if es_tabular() else [f"{eje[i]:.0f}" for i in orden]),
                     orientation="h", marker_color=colores,
                 ))
                 fig.update_layout(height=max(350, 22 * top_n), xaxis_title=f"Loading on PC{pc_elegido}",
-                                   yaxis_title="Wavenumber")
+                                   yaxis_title=("Variable" if es_tabular() else "Wavenumber"))
                 st.plotly_chart(fig, width='stretch')
 
         elif herramienta == "Loadings correlation plot":
@@ -2550,7 +3320,7 @@ if _abierta(tabs[7]):
                                           name="All variables"))
                 fig.add_trace(go.Scatter(x=load_x_n[top_idx], y=load_y_n[top_idx], mode="markers+text",
                                           marker=dict(size=9, color="darkred"),
-                                          text=[f"{eje[i]:.0f}" for i in top_idx],
+                                          text=(list(etiquetas_var(eje[top_idx])) if es_tabular() else [f"{eje[i]:.0f}" for i in top_idx]),
                                           textposition="top center", name=f"Top {top_n}"))
                 theta = np.linspace(0, 2 * np.pi, 100)
                 for rad in (0.5, 1.0):
@@ -2735,14 +3505,14 @@ if _abierta(tabs[7]):
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key="descargar_mcr_excel",
                 )
-    with tabs[7]:
+    with tabs[10]:
         _frag_tab_7()
 
 
 # -----------------------------------------------------------------------
 # TAB: CLASSIFICATION
 # -----------------------------------------------------------------------
-if _abierta(tabs[9]):
+if _abierta(tabs[12]):
     # Each tab re-runs ON ITS OWN when one of its widgets changes (fragment), instead of
     # re-executing the whole app. Buttons that must refresh other parts call st.rerun().
     @st.fragment
@@ -3023,7 +3793,8 @@ if _abierta(tabs[9]):
                             fig_vars.update_layout(height=380, xaxis_title="Wavenumber", yaxis_title="Signal")
                             if eje_r[0] > eje_r[-1]:
                                 fig_vars.update_xaxes(autorange="reversed")
-                            st.plotly_chart(fig_vars, width='stretch')
+                            if not es_tabular():
+                                st.plotly_chart(fig_vars, width='stretch')
 
                             st.markdown("**List of selected variables**")
                             df_vars_sel = df_variables_seleccionadas(eje_r, mascara_variables)
@@ -3338,6 +4109,7 @@ if _abierta(tabs[9]):
                                 "mascara_variables": eje_y_mascara_para_guardar("clf", mascara_variables)[1],
                                 "numeros_onda": eje_y_mascara_para_guardar("clf", mascara_variables)[0],
                                 "pasos_pretratamiento": st.session_state["clf_pasos_pretratamiento"],
+                                **_extras_tabular(),
                                 "ficha": ficha,
                             }
                             st.session_state["clf_ultima_ficha"] = ficha
@@ -3355,13 +4127,13 @@ if _abierta(tabs[9]):
                                 data=bytes(pdf_ficha.output()),
                                 file_name=f"model_card_{nombre_guardado}.pdf", mime="application/pdf",
                             )
-    with tabs[9]:
+    with tabs[12]:
         _frag_tab_9()
 
 
 # TAB: SIMCA
 # -----------------------------------------------------------------------
-if _abierta(tabs[10]):
+if _abierta(tabs[13]):
     # Each tab re-runs ON ITS OWN when one of its widgets changes (fragment), instead of
     # re-executing the whole app. Buttons that must refresh other parts call st.rerun().
     @st.fragment
@@ -3690,17 +4462,18 @@ if _abierta(tabs[10]):
                             "mascara_variables": eje_y_mascara_para_guardar("simca", None)[1],
                             "numeros_onda": eje_y_mascara_para_guardar("simca", None)[0],
                             "pasos_pretratamiento": st.session_state["simca_pasos_pretratamiento"],
+                            **_extras_tabular(),
                             "ficha": ficha_simca,
                         }
                         st.success(f"SIMCA model set '{nombre_guardado_simca}' saved (traceability ID: "
                                    f"{id_trazabilidad_simca}). It is now available in the Prediction tab.")
-    with tabs[10]:
+    with tabs[13]:
         _frag_tab_10()
 
 
 # TAB: REGRESSION
 # -----------------------------------------------------------------------
-if _abierta(tabs[11]):
+if _abierta(tabs[14]):
     # Each tab re-runs ON ITS OWN when one of its widgets changes (fragment), instead of
     # re-executing the whole app. Buttons that must refresh other parts call st.rerun().
     @st.fragment
@@ -4031,7 +4804,8 @@ if _abierta(tabs[11]):
                             fig_vars_r.update_layout(height=380, xaxis_title="Wavenumber", yaxis_title="Signal")
                             if eje_rr[0] > eje_rr[-1]:
                                 fig_vars_r.update_xaxes(autorange="reversed")
-                            st.plotly_chart(fig_vars_r, width='stretch')
+                            if not es_tabular():
+                                st.plotly_chart(fig_vars_r, width='stretch')
 
                             st.markdown("**List of selected variables**")
                             df_vars_sel_r = df_variables_seleccionadas(eje_rr, mascara_variables_r)
@@ -4384,6 +5158,7 @@ if _abierta(tabs[11]):
                                 "mascara_variables": eje_y_mascara_para_guardar("reg", mascara_variables_r)[1],
                                 "numeros_onda": eje_y_mascara_para_guardar("reg", mascara_variables_r)[0],
                                 "pasos_pretratamiento": st.session_state["reg_pasos_pretratamiento"],
+                                **_extras_tabular(),
                                 "ficha": ficha_r,
                                 # Cross-validation RMSE, kept to build an approximate 95% prediction
                                 # interval later (point prediction ± 1.96 x RMSE_cv) — a standard,
@@ -4407,13 +5182,13 @@ if _abierta(tabs[11]):
                                 file_name=f"model_card_{nombre_guardado_r}.pdf", mime="application/pdf",
                                 key="descargar_ficha_reg",
                             )
-    with tabs[11]:
+    with tabs[14]:
         _frag_tab_11()
 
 
 # TAB: PREDICTION ON NEW SAMPLES
 # -----------------------------------------------------------------------
-if _abierta(tabs[12]):
+if _abierta(tabs[15]):
     # Each tab re-runs ON ITS OWN when one of its widgets changes (fragment), instead of
     # re-executing the whole app. Buttons that must refresh other parts call st.rerun().
     @st.fragment
@@ -4506,22 +5281,40 @@ if _abierta(tabs[12]):
                     else:
                         df_nuevo = pd.read_excel(archivo_nuevo, index_col=0)
                     ids_nuevo = df_nuevo.index.astype(str).to_numpy()
-                    eje_nuevo = ejes_a_float(df_nuevo.columns.tolist())
-                    X_nuevo = df_nuevo.to_numpy(dtype=float)
+                    if bundle.get("nombres_var") is not None:
+                        # TABULAR model: match the new columns BY NAME, then apply the fitted preprocessor
+                        nombres_ent = [str(n) for n in bundle["nombres_var"]]
+                        cols_nuevo = {str(c).strip(): c for c in df_nuevo.columns}
+                        eje_t = np.asarray(bundle["tab_eje"], dtype=float)
+                        req = [nombres_ent[int(i) - 1] for i in eje_t]
+                        faltan = [n for n in req if n not in cols_nuevo]
+                        if faltan:
+                            raise ValueError("these variables used by the model are missing in the new file: "
+                                             + ", ".join(faltan[:10]) + ("..." if len(faltan) > 10 else ""))
+                        X_nuevo_t = df_nuevo[[cols_nuevo[n] for n in req]].to_numpy(dtype=float)
+                        X_interp = X_nuevo_t
+                        fuera_de_rango = False
+                        prep_t = bundle.get("tab_prep")
+                        X_pret_nuevo = prep_t.transform(X_nuevo_t) if prep_t is not None else X_nuevo_t
+                        if not np.array_equal(np.asarray(bundle["numeros_onda"], dtype=float), eje_t):
+                            raise ValueError("this model was trained on a different set of variables than the saved axis.")
+                    else:
+                        eje_nuevo = ejes_a_float(df_nuevo.columns.tolist())
+                        X_nuevo = df_nuevo.to_numpy(dtype=float)
 
-                    # 1) Interpolate onto the exact axis the model was trained with
-                    #    (supports the new instrument not measuring exactly the same
-                    #    wavenumbers / bins as during calibration).
-                    X_interp, fuera_de_rango = cu.interpolar_a_eje(X_nuevo, eje_nuevo, bundle["numeros_onda"])
-                    if fuera_de_rango:
-                        st.warning("The spectral axis of the new file does not fully cover the range "
-                                   "used to train the model — there is extrapolation at the edges, "
-                                   "results there may be less reliable.")
+                        # 1) Interpolate onto the exact axis the model was trained with
+                        #    (supports the new instrument not measuring exactly the same
+                        #    wavenumbers / bins as during calibration).
+                        X_interp, fuera_de_rango = cu.interpolar_a_eje(X_nuevo, eje_nuevo, bundle["numeros_onda"])
+                        if fuera_de_rango:
+                            st.warning("The spectral axis of the new file does not fully cover the range "
+                                       "used to train the model — there is extrapolation at the edges, "
+                                       "results there may be less reliable.")
 
-                    # 2) Apply exactly the same preprocessing (Step A/B) used during training
-                    X_pret_nuevo = X_interp
-                    for paso_tup in bundle["pasos_pretratamiento"]:
-                        X_pret_nuevo = aplicar_paso(X_pret_nuevo, paso_tup)
+                        # 2) Apply exactly the same preprocessing (Step A/B) used during training
+                        X_pret_nuevo = X_interp
+                        for paso_tup in bundle["pasos_pretratamiento"]:
+                            X_pret_nuevo = aplicar_paso(X_pret_nuevo, paso_tup)
 
                     # 3) Apply the same variable selection (if any)
                     if bundle["mascara_variables"] is not None:
@@ -4672,14 +5465,14 @@ if _abierta(tabs[12]):
             if st.button("🗑️ Delete all saved models"):
                 st.session_state.modelos_guardados = {}
                 _rerun_tab()
-    with tabs[12]:
+    with tabs[15]:
         _frag_tab_12()
 
 
 # -----------------------------------------------------------------------
 # TAB: FINAL REPORT
 # -----------------------------------------------------------------------
-if _abierta(tabs[13]):
+if _abierta(tabs[16]):
     # Each tab re-runs ON ITS OWN when one of its widgets changes (fragment), instead of
     # re-executing the whole app. Buttons that must refresh other parts call st.rerun().
     @st.fragment
@@ -4786,7 +5579,7 @@ if _abierta(tabs[13]):
                               help="Removes the built report from memory."):
                     st.session_state.pop("informe_final", None)
                     _rerun_tab()
-    with tabs[13]:
+    with tabs[16]:
         _frag_tab_13()
 
 
@@ -4799,6 +5592,11 @@ if _abierta(tabs[3]):
     @st.fragment
     def _frag_tab_3():
         st.subheader("Crop spectral regions")
+        if es_tabular():
+            st.info("Cropping spectral regions does not apply to tabular variables. To leave variables out, use "
+                    "**Preprocessing** (exclusion list and missing-value filter) or the variable-selection options "
+                    "of the Classification / Regression tabs.")
+            return
         if sc is None:
             st.error("The module `screening_en.py` is missing. Upload it to the same folder as "
                      "`app_en.py` to enable this tab.")
@@ -4949,7 +5747,7 @@ if _abierta(tabs[3]):
 # -----------------------------------------------------------------------
 # TAB: MODEL SCREENING
 # -----------------------------------------------------------------------
-if _abierta(tabs[8]):
+if _abierta(tabs[11]):
     # Each tab re-runs ON ITS OWN when one of its widgets changes (fragment), instead of
     # re-executing the whole app. Buttons that must refresh other parts call st.rerun().
     @st.fragment
@@ -5247,6 +6045,6 @@ if _abierta(tabs[8]):
                             st.session_state[f"pret_w_b_{_tipo_run}"] = _mapa_rec[_rec_n][1]
                             st.session_state["pret_w_orden"] = "A → B (recommended)"
                             st.success("Done — now open the 🧪 Preprocessing tab and click **Apply**.")
-    with tabs[8]:
+    with tabs[11]:
         _frag_tab_8()
 
