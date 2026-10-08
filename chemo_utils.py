@@ -417,7 +417,7 @@ def _calcular_q_cruzado(X_clase, n_comp, k_folds=None, random_state=0):
     return Q_cv
 
 
-def entrenar_modelo_simca(X_clase, n_comp=None, varianza_objetivo=0.95, alpha=0.05):
+def entrenar_modelo_simca(X_clase, n_comp=None, varianza_objetivo=0.95, alpha=0.05, regla="clasica"):
     """
     Fits a class-specific PCA model for SIMCA: a separate PCA model per
     class, used to test whether a new sample "belongs" to that class (based
@@ -474,7 +474,23 @@ def entrenar_modelo_simca(X_clase, n_comp=None, varianza_objetivo=0.95, alpha=0.
         # widen it if it's tighter than what cross-validation suggests.
         Q_lim = max(Q_lim, np.percentile(Q_para_limite, 100 * (1 - alpha)))
 
+    dd = None
+    if regla == "dd":
+        # DD-SIMCA (Pomerantsev): the score distance h and orthogonal distance q follow scaled chi-square
+        # distributions, whose scale (h0, q0) and degrees of freedom (Nh, Nq) are estimated from the
+        # calibration data by moments; a sample is accepted when Nh*h/h0 + Nq*q/q0 <= chi2(Nh+Nq).
+        from scipy.stats import chi2 as _chi2
+
+        def _nu(v):
+            v = np.asarray(v, dtype=float)
+            m, sd = float(np.mean(v)), float(np.std(v, ddof=1)) if len(v) > 1 else 0.0
+            return max(m, 1e-12), int(np.clip(round(2 * (m / sd) ** 2) if sd > 0 else 1, 1, 100))
+        h0, Nh = _nu(T2_calibracion)
+        q0, Nq = _nu(Q_para_limite)
+        dd = {"h0": h0, "Nh": Nh, "q0": q0, "Nq": Nq, "crit": float(_chi2.ppf(1 - alpha, Nh + Nq))}
+
     return {
+        "dd": dd,
         "media": media, "cargas": cargas, "autovalores": autovalores, "n_comp": n_comp_final,
         "T2_lim": T2_lim, "Q_lim": Q_lim,
         "T2_calibracion": T2_calibracion, "Q_calibracion": Q_calibracion,
@@ -500,7 +516,11 @@ def evaluar_muestras_simca(X_nuevo, modelo_clase):
     scores = X_centrado @ modelo_clase["cargas"].T
     T2 = calcular_T2(scores, modelo_clase["autovalores"], modelo_clase["n_comp"])
     Q = calcular_Q(X_nuevo, scores, modelo_clase["cargas"], modelo_clase["n_comp"], media=modelo_clase["media"])
-    dentro = (T2 <= modelo_clase["T2_lim"]) & (Q <= modelo_clase["Q_lim"])
+    dd = modelo_clase.get("dd")
+    if dd is not None:
+        dentro = (dd["Nh"] * T2 / dd["h0"] + dd["Nq"] * Q / dd["q0"]) <= dd["crit"]
+    else:
+        dentro = (T2 <= modelo_clase["T2_lim"]) & (Q <= modelo_clase["Q_lim"])
     return T2, Q, dentro
 
 # =============================================================================

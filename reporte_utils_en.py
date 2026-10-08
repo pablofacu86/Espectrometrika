@@ -631,6 +631,7 @@ def seccion_ficha_modelo(pdf, ficha):
     lista_clave_valor(pdf, [
         ("Preprocessing applied", ficha.get("pretratamiento_desc", "none")),
         ("Variable selection method", ficha.get("seleccion_variables_desc", "none")),
+        ("Data augmentation (training folds only)", ficha.get("aumento_datos", "none")),
     ])
 
     if ficha.get("hiperparametros"):

@@ -583,6 +583,7 @@ def evaluar_clasificacion(modelo, X, y, cv=5, random_state=0):
     y_pred = cross_val_predict(modelo, X, y, cv=splitter, n_jobs=N_JOBS)
 
     auc = None
+    y_proba = None
     if hasattr(modelo, "predict_proba"):
         try:
             y_proba = cross_val_predict(modelo, X, y, cv=splitter, method="predict_proba", n_jobs=N_JOBS)
@@ -606,6 +607,8 @@ def evaluar_clasificacion(modelo, X, y, cv=5, random_state=0):
         "kappa": cohen_kappa_score(y, y_pred),
         "mcc": float(matthews_corrcoef(y, y_pred)),
         "auc": auc,
+        "y_proba": y_proba,                       # out-of-fold probabilities (calibration for conformal prediction)
+        "clases_proba": np.unique(y),
         "matriz_confusion": confusion_matrix(y, y_pred),
         "reporte_por_clase": classification_report(y, y_pred, output_dict=True, zero_division=0),
         "clases": np.unique(y),
