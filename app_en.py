@@ -111,6 +111,18 @@ def _traza_espectro(eje, y, gl=False, **kw):
     every trace. A 264 x 700 spectra plot goes from ~6.5 MB to ~1 MB sent to the browser."""
     eje = np.asarray(eje, dtype=float)
     y = np.asarray(y, dtype=np.float32)
+    if len(eje) > 8000:
+        # Very high resolution spectra (NMR with tens of thousands of points): a screen only has
+        # ~1500 pixels across, so draw the min and max of each block of points. The shape and every
+        # peak look identical, but the browser gets ~6000 points instead of 29000 per spectrum.
+        # DISPLAY ONLY - the analyses always use the full-resolution data.
+        _nb = 3000
+        _lim = (len(y) // _nb) * _nb
+        _b = np.nan_to_num(y[:_lim], nan=0.0).reshape(_nb, -1)
+        _i0 = np.arange(_nb)[:, None] * _b.shape[1]
+        _idx = np.sort(np.concatenate([(_i0[:, 0] + _b.argmin(axis=1)), (_i0[:, 0] + _b.argmax(axis=1))]))
+        _idx = np.unique(np.concatenate([[0], _idx, [len(y) - 1]]))
+        eje, y = eje[_idx], y[_idx]
     d = np.diff(eje)
     if len(eje) > 2 and np.allclose(d, d[0], rtol=1e-6, atol=0):
         extra = dict(x0=float(eje[0]), dx=float(d[0]))
@@ -395,8 +407,11 @@ def _separador_csv(bytes_archivo):
     if primera.count(sep) == 0:
         sep = ","
     coma_decimal = sep != "," and any(re.search(r"\d,\d", l) for l in lineas[1:])
-    n_campos = max((l.count(sep) for l in bytes_archivo[:200000].decode("utf-8-sig", errors="ignore")
-                    .splitlines()[:15]), default=0) + 1
+    # Count fields over the first 15 COMPLETE lines (a header with tens of thousands of
+    # variables is longer than any fixed byte window, so slicing by bytes would cut it short).
+    _lineas15 = bytes_archivo.split(b"\n", 15)[:15]
+    _sepb = sep.encode()
+    n_campos = max((l.count(_sepb) for l in _lineas15), default=0) + 1
     return sep, coma_decimal, n_campos
 
 
@@ -441,6 +456,43 @@ def _aplicar_encabezado(raw, fila_encabezado, coma_decimal):
         else:
             vistos[h] = 0
         etiquetas.append(h)
+    # Fast path: convert the whole block to numbers column by column at the numpy level
+    # (a pandas Series per column is very slow with 10^4+ variables). Columns that do not
+    # convert (IDs, class labels, decimal-comma text...) fall through to the careful path below.
+    _vals = datos.to_numpy(dtype=object)
+    _bloque = np.full(_vals.shape, np.nan)
+    _fallan = []
+    for j in range(_vals.shape[1]):
+        try:
+            _bloque[:, j] = _vals[:, j].astype(float)
+        except (ValueError, TypeError):
+            _fallan.append(j)
+    def _con_enteros(res):
+        # leading columns that hold whole numbers (class codes, counts...) keep an integer type,
+        # as they did when each column was parsed on its own
+        for j in range(min(10, _bloque.shape[1])):
+            c = _bloque[:, j]
+            if j not in _fallan and len(c) and np.isfinite(c).all() and (c == np.floor(c)).all():
+                res[etiquetas[j]] = c.astype("int64")
+        return res
+
+    if not _fallan:
+        return _con_enteros(pd.DataFrame(_bloque, columns=etiquetas))
+    if len(_fallan) < 0.5 * max(1, _vals.shape[1]):
+        res = pd.DataFrame(_bloque, columns=etiquetas)
+        _con_enteros(res)
+        for j in _fallan:
+            col = datos.iloc[:, j].reset_index(drop=True)
+            if not pd.api.types.is_numeric_dtype(col):
+                conv = pd.to_numeric(col, errors="coerce")
+                if conv.notna().sum() == col.notna().sum():
+                    col = conv
+                elif coma_decimal:
+                    conv = pd.to_numeric(col.astype(str).str.replace(",", ".", regex=False), errors="coerce")
+                    if conv.notna().sum() == col.notna().sum():
+                        col = conv
+            res[etiquetas[j]] = col
+        return res
     columnas = {}
     for j, etq in enumerate(etiquetas):
         col = datos.iloc[:, j]
@@ -469,7 +521,16 @@ def _leer_preview_cacheada(bytes_archivo, nombre_archivo, hoja):
     """First rows of the raw table (no header assumed), for the 'raw preview' expander."""
     _, hojas, _ = _leer_crudo_cacheado(bytes_archivo, nombre_archivo)
     raw = hojas[hoja] if hoja in hojas else next(iter(hojas.values()))
-    return raw.head(6).astype(str)
+    # Only the first rows AND a handful of columns are needed to pick the header row; converting
+    # tens of thousands of columns to text one by one (wide NMR/Raman files) took many seconds.
+    n_col = raw.shape[1]
+    cols = list(range(min(n_col, 14))) + (list(range(n_col - 3, n_col)) if n_col > 17 else [])
+    vista = raw.iloc[:6, cols].to_numpy(dtype=object)
+    out = pd.DataFrame([[("" if (isinstance(v, float) and np.isnan(v)) else str(v)) for v in fila] for fila in vista],
+                       columns=[str(c) for c in cols])
+    if n_col > 17:
+        out.insert(14, "…", "…")
+    return out
 
 
 @st.cache_data(show_spinner=False, max_entries=12, ttl=3600)
@@ -1454,7 +1515,15 @@ if _abierta(tabs[1]):
     @st.fragment
     def _frag_tab_1():
         st.subheader("Data preview")
-        st.dataframe(st.session_state.df.head(10), width='stretch')
+        _df_prev = st.session_state.df.head(10)
+        if _df_prev.shape[1] > 20:
+            # wide spectra (thousands of variables): a table with every column is slow to build and
+            # draw and unreadable anyway - show the leading columns and the last few
+            st.dataframe(pd.concat([_df_prev.iloc[:, :14], _df_prev.iloc[:, -3:]], axis=1), width='stretch')
+            st.caption(f"Showing 17 of {_df_prev.shape[1]} columns (the first 14 and the last 3). "
+                       "All variables are used in the analyses.")
+        else:
+            st.dataframe(_df_prev, width='stretch')
 
         ids, X, clases = datos_activos()
 
